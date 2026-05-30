@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, Activity, Lightbulb, PlayCircle, Download } from 'lucide-react';
 
@@ -42,27 +42,6 @@ const steps = [
 
 export default function PipelineSection() {
   const [currentFeature, setCurrentFeature] = useState(0);
-  const [progress, setProgress] = useState(0);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setProgress((prev) => prev + 2.5);
-    }, 100);
-
-    return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    if (progress >= 100) {
-      setCurrentFeature((prev) => (prev + 1) % steps.length);
-      setProgress(0);
-    }
-  }, [progress]);
-
-  const handleStepClick = (index) => {
-    setCurrentFeature(index);
-    setProgress(0);
-  };
 
   return (
     <section id="pipeline" style={{ background: 'var(--bg-surface)', position: 'relative', padding: '6rem 2rem' }}>
@@ -112,7 +91,8 @@ export default function PipelineSection() {
               return (
                 <motion.div
                   key={index}
-                  onClick={() => handleStepClick(index)}
+                  onMouseEnter={() => setCurrentFeature(index)}
+                  onClick={() => setCurrentFeature(index)}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -195,7 +175,7 @@ export default function PipelineSection() {
                       <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#febc2e' }}/>
                       <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#28c840' }}/>
                       <div style={{ marginLeft: '8px', fontSize: '12px', color: '#6c7086', fontFamily: 'monospace' }}>
-                        neatnode · {feature.step.toLowerCase().replace(' ', '_')}
+                        neatnode · {feature.title.toLowerCase().replace(' & ', '_').replace(' ', '_')}.py
                       </div>
                     </div>
 
@@ -225,33 +205,6 @@ export default function PipelineSection() {
                       </pre>
                     </div>
 
-                    {/* Step label overlay */}
-                    <div style={{
-                      position: 'absolute',
-                      bottom: '1rem',
-                      left: '1rem',
-                      background: 'rgba(0,0,0,0.4)',
-                      padding: '0.35rem 0.75rem',
-                      borderRadius: '8px',
-                      backdropFilter: 'blur(8px)',
-                      WebkitBackdropFilter: 'blur(8px)',
-                      border: '1px solid rgba(255,255,255,0.1)'
-                    }}>
-                      <span style={{ color: '#cdd6f4', fontSize: '0.75rem', fontWeight: 600 }}>
-                        {feature.step}
-                      </span>
-                    </div>
-
-                    {/* Progress bar line */}
-                    <div style={{
-                      position: 'absolute',
-                      bottom: 0,
-                      left: 0,
-                      height: '3px',
-                      background: 'var(--accent-primary)',
-                      width: `${progress}%`,
-                    }} />
-
                   </motion.div>
                 )
               )}
@@ -262,4 +215,3 @@ export default function PipelineSection() {
     </section>
   );
 }
-
