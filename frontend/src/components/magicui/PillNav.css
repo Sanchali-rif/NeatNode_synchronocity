@@ -1,0 +1,295 @@
+/* ─── PillNav – adapted from React Bits ─── */
+
+.pill-nav-container {
+  position: relative;
+  top: auto;
+  z-index: 99;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  --nav-h: 46px;
+}
+
+@media (max-width: 768px) {
+  .pill-nav-container {
+    width: 100%;
+  }
+}
+
+.pill-nav {
+  --logo: 36px;
+  --pill-pad-x: 16px;
+  --pill-gap: 3px;
+  width: max-content;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+}
+
+@media (max-width: 768px) {
+  .pill-nav {
+    width: 100%;
+    justify-content: space-between;
+    padding: 0 1rem;
+    background: transparent;
+  }
+}
+
+/* Nav items pill container */
+.pill-nav-items {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: var(--nav-h);
+  background: var(--base, #0a0820);
+  border-radius: 9999px;
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.08),
+    0 2px 12px rgba(91, 73, 233, 0.25),
+    0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+/* Light theme override for nav items */
+:root .pill-nav-items {
+  border-color: rgba(91, 73, 233, 0.35);
+  box-shadow:
+    0 0 0 1px rgba(91, 73, 233, 0.1),
+    0 2px 16px rgba(91, 73, 233, 0.3),
+    0 8px 32px rgba(91, 73, 233, 0.12);
+}
+
+/* Logo circle */
+.pill-logo {
+  width: var(--nav-h);
+  height: var(--nav-h);
+  border-radius: 50%;
+  background: var(--base, #0a0820);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  padding: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.08),
+    0 2px 12px rgba(91, 73, 233, 0.3),
+    0 8px 24px rgba(0, 0, 0, 0.18);
+  text-decoration: none;
+  transition: box-shadow 0.3s ease, transform 0.3s ease;
+}
+
+.pill-logo:hover {
+  box-shadow:
+    0 0 0 1px rgba(139, 92, 246, 0.2),
+    0 2px 16px rgba(91, 73, 233, 0.45),
+    0 8px 28px rgba(0, 0, 0, 0.22);
+  transform: scale(1.04);
+}
+
+/* Light theme logo override */
+:root .pill-logo {
+  border-color: rgba(91, 73, 233, 0.5);
+  box-shadow:
+    0 0 0 1px rgba(91, 73, 233, 0.12),
+    0 2px 14px rgba(91, 73, 233, 0.45),
+    0 8px 24px rgba(91, 73, 233, 0.2);
+}
+
+:root .pill-logo:hover {
+  box-shadow:
+    0 0 0 2px rgba(91, 73, 233, 0.3),
+    0 2px 18px rgba(91, 73, 233, 0.6),
+    0 8px 30px rgba(91, 73, 233, 0.25);
+}
+
+.pill-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* Nav list */
+.pill-list {
+  list-style: none;
+  display: flex;
+  align-items: stretch;
+  gap: var(--pill-gap);
+  margin: 0;
+  padding: 4px;
+  height: 100%;
+}
+
+.pill-list > li {
+  display: flex;
+  height: 100%;
+}
+
+/* Individual nav pill */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 var(--pill-pad-x);
+  background: var(--pill-bg, #1e1a2e);
+  color: var(--pill-text, rgba(220,216,255,0.8));
+  text-decoration: none;
+  border-radius: 9999px;
+  box-sizing: border-box;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  font-family: inherit;
+}
+
+.pill .hover-circle {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  border-radius: 50%;
+  background: var(--base, #0d0b1a);
+  z-index: 1;
+  display: block;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.pill .label-stack {
+  position: relative;
+  display: inline-block;
+  line-height: 1;
+  z-index: 2;
+}
+
+.pill .pill-label {
+  position: relative;
+  z-index: 2;
+  display: inline-block;
+  line-height: 1;
+  will-change: transform;
+}
+
+.pill .pill-label-hover {
+  position: absolute;
+  left: 0;
+  top: 0;
+  color: var(--hover-text, rgba(220,216,255,0.95));
+  z-index: 3;
+  display: inline-block;
+  will-change: transform, opacity;
+}
+
+.pill.is-active::after {
+  content: '';
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 10px;
+  background: var(--base, #0d0b1a);
+  border-radius: 50px;
+  z-index: 4;
+}
+
+/* Desktop / Mobile visibility */
+.desktop-only { display: block; }
+.mobile-only  { display: none;  }
+
+@media (max-width: 768px) {
+  .desktop-only { display: none;  }
+  .mobile-only  { display: block; }
+}
+
+/* Hamburger */
+.mobile-menu-button {
+  width: var(--nav-h);
+  height: var(--nav-h);
+  border-radius: 50%;
+  background: var(--base, #0d0b1a);
+  border: 1px solid rgba(255,255,255,0.1);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  cursor: pointer;
+  padding: 0;
+  position: relative;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+@media (max-width: 768px) {
+  .mobile-menu-button { display: flex; }
+}
+
+.hamburger-line {
+  width: 16px;
+  height: 2px;
+  background: var(--pill-text, rgba(220,216,255,0.85));
+  border-radius: 1px;
+  transform-origin: center;
+}
+
+/* Mobile popover */
+.mobile-menu-popover {
+  position: absolute;
+  top: calc(var(--nav-h) + 10px);
+  left: 0;
+  right: 0;
+  background: var(--base, #0d0b1a);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 24px;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  z-index: 998;
+  opacity: 0;
+  transform-origin: top center;
+  visibility: hidden;
+}
+
+.mobile-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mobile-menu-popover .mobile-menu-link {
+  display: block;
+  padding: 12px 18px;
+  color: var(--pill-text, rgba(220,216,255,0.85));
+  background-color: var(--pill-bg, #1e1a2e);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-radius: 50px;
+  transition: all 0.2s ease;
+  font-family: inherit;
+}
+
+.mobile-menu-popover .mobile-menu-link:hover,
+.mobile-menu-popover .mobile-menu-link.is-active {
+  background-color: var(--base);
+  color: var(--hover-text, rgba(220,216,255,0.95));
+}
