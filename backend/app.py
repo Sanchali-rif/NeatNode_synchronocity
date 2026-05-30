@@ -14,7 +14,7 @@ from query_assistant import DataQueryAssistant
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    CORS(app, origins=["http://localhost:5173", "http://localhost:5174", "https://neatnode.onrender.com", "https://neat-node.vercel.app", "*"])
+    CORS(app, origins=["http://localhost:5173", "http://localhost:5174", "https://neatnode.onrender.com", "https://neat-node.vercel.app", "https://neatnode-synchronocity.onrender.com"])
     app.secret_key = "dev-secret-key"
     cleaner = CSVCleaningModel()
     assistant = DataQueryAssistant()
