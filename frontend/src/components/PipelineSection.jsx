@@ -8,35 +8,35 @@ const steps = [
     title: 'Upload Dataset',
     content: 'Securely upload CSV, JSON, Parquet — or connect directly to your database.',
     icon: <Upload size={24} />,
-    code: `import neatnode as nn\n\n# Load your messy dataset\ndataset = nn.upload('sales_2023.csv')\nprint(f"Loaded {len(dataset):,} rows, {len(dataset.columns)} columns")`
+    code: `# Upload your CSV to NeatNode\nimport requests\n\nresponse = requests.post(\n    "https://api.neatnode.app/upload",\n    files={"file": open("sales_2023.csv", "rb")}\n)\n\nprint(response.json())\n# → {"rows": 6000, "columns": 17, "status": "ready"}`
   },
   {
     step: 'Step 2',
     title: 'Auto Profiling',
     content: 'AI scans every column — detecting dtypes, nulls, outliers, and mixed-type anomalies.',
     icon: <Activity size={24} />,
-    code: `# Run intelligent profiling\nprofile = nn.profile(dataset)\n\n# Discovered:\n# → 14.2% missing in revenue_usd\n# → 3 mixed-type columns\n# → 12 statistical outliers`
+    code: `# NeatNode · Auto Profiling\n\nfor col in df.columns:\n    print(f"{col}: {df[col].dtype} | nulls: {df[col].isnull().sum()}")\n\n# → age: float64 | nulls: 1529\n# → gender: object | nulls: 478\n# → blood_group: object | nulls: 1023`
   },
   {
     step: 'Step 3',
     title: 'Strategy Selection',
     content: 'A tailored cleaning strategy is proposed. Review and approve each action before anything runs.',
     icon: <Lightbulb size={24} />,
-    code: `strategy = nn.suggest_strategy(profile)\nstrategy.preview()\n\n# Action 1: KNN Impute on 'revenue_usd'\n# Action 2: Mode fill + Target Encode 'category'\n# Action 3: Drop 'customer_id' (high cardinality)`
+    code: `# NeatNode · Strategy Selection\n\nstrategy = {\n    "age": "fill with median",\n    "gender": "fill with mode",\n    "blood_group": "fill with mode"\n}\n\n# Review and approve before anything runs\nprint("Proposed strategy:", strategy)\n# → Approve? (yes/no): yes`
   },
   {
     step: 'Step 4',
     title: 'Pipeline Execution',
     content: 'Approve and execute. Transformations run in parallel, tracked in a full decision log.',
     icon: <PlayCircle size={24} />,
-    code: `# Execute approved strategy\nclean = nn.execute(strategy, verbose=True)\n\n# ✓ Imputed 1,748 missing values\n# ✓ Encoded 'category' → 8 features\n# ✓ Removed 'customer_id'\n# Done in 1.4s`
+    code: `# NeatNode · Pipeline Execution\n\nfor col, strategy in approved_strategy.items():\n    if strategy == "fill with median":\n        df[col].fillna(df[col].median(), inplace=True)\n    elif strategy == "fill with mode":\n        df[col].fillna(df[col].mode()[0], inplace=True)\n\nprint(f"Pipeline complete: {len(df):,} rows cleaned")\n# → Pipeline complete: 5,566 rows cleaned`
   },
   {
     step: 'Step 5',
     title: 'Export & Reuse',
     content: 'Export your clean data and the reusable Python pipeline — CI/CD ready.',
     icon: <Download size={24} />,
-    code: `# Save outputs\nclean.to_csv('clean_sales.csv', index=False)\n\n# Export pipeline for production\nnn.export_pipeline('clean_pipeline.py')\n# → Ready for Airflow, Prefect, or CI/CD`
+    code: `# NeatNode · Export & Reuse\n\n# Export clean data\ndf.to_csv("sales_2023_clean.csv", index=False)\n\n# Export reusable pipeline\nwith open("pipeline.py", "w") as f:\n    f.write(pipeline_code)\n\nprint("Export complete — CI/CD ready")\n# → sales_2023_clean.csv saved\n# → pipeline.py saved`
   },
 ];
 
@@ -46,7 +46,7 @@ export default function PipelineSection() {
   return (
     <section id="pipeline" style={{ background: 'var(--bg-surface)', position: 'relative', padding: '6rem 2rem' }}>
       <div className="container" style={{ maxWidth: '1200px', margin: '0 auto' }}>
-        
+
         {/* Header */}
         <div style={{ position: 'relative', textAlign: 'center', marginBottom: '4rem' }}>
           <div style={{ position: 'relative', zIndex: 10 }}>
@@ -60,7 +60,7 @@ export default function PipelineSection() {
               Neatnode helps you upload, profile, clean, and export your dataset faster than ever before.
             </p>
           </div>
-          
+
           <div style={{
             position: 'absolute',
             top: '50%',
@@ -149,7 +149,7 @@ export default function PipelineSection() {
             background: 'var(--bg-surface)',
           }}>
             <AnimatePresence mode="wait">
-              {steps.map((feature, index) => 
+              {steps.map((feature, index) =>
                 index === currentFeature && (
                   <motion.div
                     key={index}
@@ -171,9 +171,9 @@ export default function PipelineSection() {
                       padding: '14px 18px', background: '#11111b',
                       borderBottom: '1px solid rgba(255,255,255,0.05)',
                     }}>
-                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#ff5f57' }}/>
-                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#febc2e' }}/>
-                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#28c840' }}/>
+                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#ff5f57' }} />
+                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#febc2e' }} />
+                      <div style={{ width: '12px', height: '12px', borderRadius: '50%', background: '#28c840' }} />
                       <div style={{ marginLeft: '8px', fontSize: '12px', color: '#6c7086', fontFamily: 'monospace' }}>
                         neatnode · {feature.title.toLowerCase().replace(' & ', '_').replace(' ', '_')}.py
                       </div>
