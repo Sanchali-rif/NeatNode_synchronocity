@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import BASE_URL from './api';
-import './Result.css';
+import "./result.css";
 
 /** Forward vertical wheel to chat history when hovering tables that only scroll horizontally */
 function ChatTableScroll({ children }) {
