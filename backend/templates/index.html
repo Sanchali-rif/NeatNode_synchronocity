@@ -1,0 +1,359 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero upload-layout">
+  <div class="hero-copy">
+    <div class="eyebrow">CSV cleaning model</div>
+    <h1>Upload messy CSV data and get a cleaned version back.</h1>
+    <p class="lead">
+      This setup uses a rule-based cleaning model that normalizes headers,
+      trims values, removes empty rows, and drops duplicate rows before showing
+      you the cleaned output.
+    </p>
+
+    <div class="stats" aria-label="Project highlights">
+      {% for item in stats %}
+      <article class="stat-card">
+        <span>{{ item.label }}</span>
+        <strong>{{ item.value }}</strong>
+      </article>
+      {% endfor %}
+    </div>
+
+    {% if cleaning_result and visualization_data %}
+    <section class="visualization-panel" aria-label="Data visualisation">
+      <div class="panel-head">
+        <span class="result-label">Data visualisation</span>
+        <p>Before and after changes are mapped below with a few different chart styles.</p>
+      </div>
+
+      <div class="viz-grid">
+        <article class="viz-card viz-donut-card">
+          <div class="viz-card-head">
+            <h2>Rows retained</h2>
+            <strong>{{ cleaning_result.cleaned_row_count }}/{{ cleaning_result.raw_row_count }}</strong>
+          </div>
+          <div class="donut-chart" style="--slice: {{ visualization_data.row_retained_percent }}%;">
+            <div class="donut-chart-inner">
+              <span>Retained</span>
+              <strong>{{ visualization_data.row_retained_percent }}%</strong>
+            </div>
+          </div>
+          <p class="viz-caption">{{ visualization_data.row_removed_percent }}% of rows were removed during cleanup.</p>
+        </article>
+
+        <article class="viz-card">
+          <div class="viz-card-head">
+            <h2>Columns before and after</h2>
+            <strong>{{ cleaning_result.cleaned_column_count }}/{{ cleaning_result.raw_column_count }}</strong>
+          </div>
+          <div class="viz-bars">
+            <div class="viz-series">
+              <div class="viz-series-head">
+                <span>Before</span>
+                <strong>{{ cleaning_result.raw_column_count }}</strong>
+              </div>
+              <div class="viz-track"><span class="viz-fill viz-fill-before" style="width: 100%;"></span></div>
+            </div>
+            <div class="viz-series">
+              <div class="viz-series-head">
+                <span>After</span>
+                <strong>{{ cleaning_result.cleaned_column_count }}</strong>
+              </div>
+              <div class="viz-track"><span class="viz-fill viz-fill-after" style="width: {{ visualization_data.column_retained_percent }}%;"></span></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="viz-card">
+          <div class="viz-card-head">
+            <h2>Cleanup actions</h2>
+            <strong>{{ cleaning_result.removed_empty_rows + cleaning_result.removed_duplicate_rows + cleaning_result.removed_outlier_rows }}</strong>
+          </div>
+          <div class="viz-bars viz-bars-tight">
+            {% for item in visualization_data.action_cards %}
+            <div class="viz-series">
+              <div class="viz-series-head">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
+              </div>
+              <div class="viz-track"><span class="viz-fill viz-fill-action" style="width: {{ item.width }}%;"></span></div>
+            </div>
+            {% endfor %}
+          </div>
+        </article>
+
+        {% if visualization_data.imputation_cards %}
+        <article class="viz-card viz-full-width">
+          <div class="viz-card-head">
+            <h2>Missing-value fills</h2>
+            <strong>{{ visualization_data.imputation_cards | length }}</strong>
+          </div>
+          <div class="viz-bars viz-bars-tight">
+            {% for item in visualization_data.imputation_cards %}
+            <div class="viz-series">
+              <div class="viz-series-head">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}</strong>
+              </div>
+              <div class="viz-track"><span class="viz-fill viz-fill-impute" style="width: {{ item.width }}%;"></span></div>
+              <p class="viz-mini-note">{{ item.strategy }} fill with {{ item.fill_value }}</p>
+            </div>
+            {% endfor %}
+          </div>
+        </article>
+        {% endif %}
+      </div>
+    </section>
+    {% endif %}
+  </div>
+
+  <div class="upload-card">
+    <form class="upload-form" method="post" enctype="multipart/form-data">
+      <label class="upload-dropzone" for="csv_file">
+        <span class="upload-icon">Clean</span>
+        <strong>Select an unclean CSV file</strong>
+        <p>Upload a messy CSV and the model will return a normalized version.</p>
+      </label>
+
+      <input id="csv_file" name="csv_file" type="file" accept=".csv,text/csv" />
+
+      <label class="prompt-field" for="cleaning_prompt">
+        <span class="result-label">Cleaning prompt, optional</span>
+        <textarea
+          id="cleaning_prompt"
+          name="cleaning_prompt"
+          rows="4"
+          placeholder="Example: clean the data, remove outliers, and keep the most useful rows for analysis."
+        >{{ cleaning_prompt or '' }}</textarea>
+      </label>
+      <p class="hint">Leave this blank to use the built-in cleaning flow. If Gemini is configured, it will also add review notes.</p>
+
+      <button type="submit" class="upload-button">Upload CSV</button>
+    </form>
+
+    <div class="message-stack" aria-live="polite">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          {% for category, message in messages %}
+          <p class="alert alert-{{ category }}">{{ message }}</p>
+          {% endfor %}
+        {% else %}
+          <p class="hint">Accepted files: .csv</p>
+        {% endif %}
+      {% endwith %}
+    </div>
+
+    {% if cleaning_result %}
+    <section class="upload-result" aria-label="Cleaned CSV summary">
+      <div class="result-header">
+        <div>
+          <span class="result-label">File</span>
+          <strong>{{ cleaning_result.filename }}</strong>
+        </div>
+
+        {% if download_token %}
+        <form class="download-form" action="{{ url_for('download_cleaned', token=download_token) }}" method="get">
+          <label class="download-format">
+            <span class="result-label">Download format</span>
+            <select name="format">
+              <option value="csv">CSV</option>
+              <option value="json">JSON</option>
+              <option value="sql">SQL insert script</option>
+              <option value="python">Python script</option>
+            </select>
+          </label>
+          <button class="download-link" type="submit">Download</button>
+        </form>
+        {% endif %}
+      </div>
+
+      <div class="result-metrics">
+        <article class="metric-card">
+          <span class="result-label">Raw columns</span>
+          <strong>{{ cleaning_result.raw_column_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Cleaned columns</span>
+          <strong>{{ cleaning_result.cleaned_column_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Raw rows</span>
+          <strong>{{ cleaning_result.raw_row_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Clean rows</span>
+          <strong>{{ cleaning_result.cleaned_row_count }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Empty rows removed</span>
+          <strong>{{ cleaning_result.removed_empty_rows }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Duplicates removed</span>
+          <strong>{{ cleaning_result.removed_duplicate_rows }}</strong>
+        </article>
+        <article class="metric-card">
+          <span class="result-label">Outlier rows removed</span>
+          <strong>{{ cleaning_result.removed_outlier_rows }}</strong>
+        </article>
+      </div>
+
+      <div class="result-panels">
+        <section class="result-panel">
+          <span class="result-label">Normalized column names</span>
+          <p>{{ cleaning_result.cleaned_headers | join(', ') }}</p>
+        </section>
+
+        <section class="result-panel">
+          <span class="result-label">AI review</span>
+          <div class="ai-summary">
+            <strong>{{ cleaning_result.ai_summary }}</strong>
+          {% if cleaning_result.prompt_used %}
+            <p>Prompt applied: {{ cleaning_result.prompt_used }}</p>
+          {% endif %}
+          </div>
+        </section>
+      </div>
+
+      <section class="result-panel">
+        <span class="result-label">Cleaning summary</span>
+        <div class="summary-list">
+          {% for item in cleaning_result.imputation_summary %}
+          <article class="summary-card">
+            <strong>{{ item.column }}</strong>
+            <p>{{ item.filled_count }} missing value{{ 's' if item.filled_count != 1 else '' }} filled using {{ item.strategy }} with {{ item.fill_value }}</p>
+          </article>
+          {% endfor %}
+
+          {% for note in cleaning_result.summary_notes %}
+          <article class="summary-card summary-note-card">
+            <strong>Note</strong>
+            <p>{{ note }}</p>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+
+      {% if cleaning_result.preview_rows %}
+      <section class="result-panel result-panel-table">
+        <div class="panel-head">
+          <span class="result-label">Cleaned preview</span>
+          <p>Showing the first {{ cleaning_result.preview_rows | length }} cleaned rows so the layout stays stable.</p>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                {% for column in cleaning_result.cleaned_headers %}
+                <th>{{ column }}</th>
+                {% endfor %}
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in cleaning_result.preview_rows %}
+              <tr>
+                {% for cell in row %}
+                <td>{{ cell if cell else '—' }}</td>
+                {% endfor %}
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {% endif %}
+
+      {% if download_token %}
+      <section class="assistant-panel" aria-label="Data assistant">
+        <div class="panel-head">
+          <span class="result-label">Data assistant</span>
+          <p>Ask the cleaned CSV in plain English and the assistant will translate it into a generic query.</p>
+        </div>
+
+        <form class="assistant-form" data-assistant-form action="{{ url_for('ask_dataset', token=download_token) }}" method="post">
+          <label class="assistant-input">
+            <span class="result-label">Ask about this dataset</span>
+            <textarea
+              data-assistant-question
+              name="data_question"
+              rows="3"
+              placeholder="Ask things like: count rows, list unique values, show rows where a column matches a value, or calculate a numeric summary."
+            >{{ assistant_question or '' }}</textarea>
+          </label>
+          <button class="upload-button assistant-button" type="submit" data-assistant-submit>Ask dataset</button>
+        </form>
+
+        <article class="assistant-answer" data-assistant-answer>
+          {% if assistant_response %}
+          <div class="assistant-answer-head">
+            <strong>{{ assistant_response.title }}</strong>
+            <span>{{ assistant_response.matched_row_count }} matched out of {{ assistant_response.total_row_count }}</span>
+          </div>
+          <p>{{ assistant_response.summary }}</p>
+
+          {% if assistant_response.detail_lines %}
+          <ul class="assistant-details">
+            {% for line in assistant_response.detail_lines %}
+            <li>{{ line }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+
+          {% if assistant_response.sql_like %}
+          <pre class="assistant-sql">{{ assistant_response.sql_like }}</pre>
+          {% endif %}
+
+          {% if assistant_response.table_rows %}
+          <div class="table-wrap assistant-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  {% for column in assistant_response.table_headers %}
+                  <th>{{ column }}</th>
+                  {% endfor %}
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in assistant_response.table_rows %}
+                <tr>
+                  {% for cell in row %}
+                  <td>{{ cell if cell else '—' }}</td>
+                  {% endfor %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endif %}
+          {% else %}
+          <p class="hint">Ask a question to see the assistant response here.</p>
+          {% endif %}
+        </article>
+
+        <div class="chat-history" data-chat-history>
+          {% if chat_history %}
+          {% for message in chat_history %}
+          <article class="chat-bubble chat-{{ message.role }}">
+            <span>{{ 'You' if message.role == 'user' else 'Assistant' }}</span>
+            <p>{{ message.content }}</p>
+          </article>
+          {% endfor %}
+          {% endif %}
+        </div>
+      </section>
+      {% endif %}
+    </section>
+    {% endif %}
+  </div>
+</section>
+
+<section class="features" aria-label="Included features">
+  {% for feature in features %}
+  <article class="feature-card">
+    <h2>{{ feature.title }}</h2>
+    <p>{{ feature.description }}</p>
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}

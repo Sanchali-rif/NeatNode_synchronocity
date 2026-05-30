@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>{{ title or "Flask Starter" }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <script>
+      (function () {
+        const storageKey = "snchronicity-theme";
+        const savedTheme = localStorage.getItem(storageKey);
+        const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const theme = savedTheme || (prefersDark ? "dark" : "light");
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+
+    <header class="app-header">
+      <div class="app-brand">
+        <span class="brand-mark">SN</span>
+        <div>
+          <p class="brand-kicker">CSV Cleaning</p>
+          <strong>Sync Neatnode</strong>
+        </div>
+      </div>
+
+      <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Toggle color theme">
+        <span class="theme-toggle-track" aria-hidden="true">
+          <span class="theme-toggle-thumb"></span>
+        </span>
+        <span class="theme-toggle-text" data-theme-toggle-label>Dark mode</span>
+      </button>
+    </header>
+
+    <main class="shell">
+      {% block content %}{% endblock %}
+    </main>
+
+    <script>
+      (function () {
+        const storageKey = "snchronicity-theme";
+        const toggle = document.querySelector("[data-theme-toggle]");
+        const label = document.querySelector("[data-theme-toggle-label]");
+
+        if (!toggle || !label) {
+          return;
+        }
+
+        const updateTheme = (theme) => {
+          document.documentElement.dataset.theme = theme;
+          localStorage.setItem(storageKey, theme);
+          const isDark = theme === "dark";
+          toggle.setAttribute("aria-pressed", String(isDark));
+          label.textContent = isDark ? "Light mode" : "Dark mode";
+        };
+
+        updateTheme(document.documentElement.dataset.theme || "light");
+
+        toggle.addEventListener("click", () => {
+          const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+          updateTheme(nextTheme);
+        });
+      })();
+
+      (function () {
+        const form = document.querySelector("[data-assistant-form]");
+        const questionInput = document.querySelector("[data-assistant-question]");
+        const answerBox = document.querySelector("[data-assistant-answer]");
+        const chatHistory = document.querySelector("[data-chat-history]");
+
+        if (!form || !questionInput || !answerBox || !chatHistory) {
+          return;
+        }
+
+        const escapeHtml = (value) =>
+          value
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/\"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+
+        const renderTable = (headers, rows) => {
+          if (!headers || !headers.length || !rows || !rows.length) {
+            return "";
+          }
+
+          const headerHtml = headers.map((header) => `<th>${escapeHtml(String(header))}</th>`).join("");
+          const bodyHtml = rows
+            .map((row) => `<tr>${row.map((cell) => `<td>${escapeHtml(cell ? String(cell) : "—")}</td>`).join("")}</tr>`)
+            .join("");
+
+          return `
+            <div class="table-wrap assistant-table-wrap">
+              <table>
+                <thead><tr>${headerHtml}</tr></thead>
+                <tbody>${bodyHtml}</tbody>
+              </table>
+            </div>
+          `;
+        };
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+
+          const question = questionInput.value.trim();
+          if (!question) {
+            return;
+          }
+
+          const submitButton = form.querySelector("[data-assistant-submit]");
+          const formData = new FormData(form);
+          const originalLabel = submitButton ? submitButton.textContent : "";
+
+          if (submitButton) {
+            submitButton.disabled = true;
+            submitButton.textContent = "Asking...";
+          }
+
+          try {
+            const response = await fetch(form.action, {
+              method: "POST",
+              headers: {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json",
+              },
+              body: formData,
+            });
+
+            const payload = await response.json();
+            if (!response.ok) {
+              throw new Error(payload.error || "assistant_error");
+            }
+
+            const assistant = payload.assistant || {};
+            const detailLines = Array.isArray(assistant.detail_lines) ? assistant.detail_lines : [];
+            const chatEntries = Array.isArray(payload.chat_history) ? payload.chat_history : [];
+
+            answerBox.innerHTML = `
+              <div class="assistant-answer-head">
+                <strong>${escapeHtml(String(assistant.title || "Assistant response"))}</strong>
+                <span>${escapeHtml(String(assistant.matched_row_count ?? 0))} matched out of ${escapeHtml(String(assistant.total_row_count ?? 0))}</span>
+              </div>
+              <p>${escapeHtml(String(assistant.summary || ""))}</p>
+              ${detailLines.length ? `<ul class="assistant-details">${detailLines.map((line) => `<li>${escapeHtml(String(line))}</li>`).join("")}</ul>` : ""}
+              ${assistant.sql_like ? `<pre class="assistant-sql">${escapeHtml(String(assistant.sql_like))}</pre>` : ""}
+              ${renderTable(assistant.table_headers || [], assistant.table_rows || [])}
+            `;
+
+            chatHistory.innerHTML = chatEntries
+              .map(
+                (message) => `
+                  <article class="chat-bubble chat-${escapeHtml(String(message.role || "assistant"))}">
+                    <span>${message.role === "user" ? "You" : "Assistant"}</span>
+                    <p>${escapeHtml(String(message.content || ""))}</p>
+                  </article>
+                `,
+              )
+              .join("");
+
+            questionInput.value = "";
+            questionInput.focus();
+          } catch (error) {
+            answerBox.innerHTML = `<p class="hint">Unable to answer that right now. Try another question.</p>`;
+          } finally {
+            if (submitButton) {
+              submitButton.disabled = false;
+              submitButton.textContent = originalLabel;
+            }
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
