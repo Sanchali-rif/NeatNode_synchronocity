@@ -22,3 +22,47 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+
+# Impeccable Design Context / AI Skills
+frontend/.agents/
+frontend/skills-lock.json
+frontend/.impeccable/
+frontend/PRODUCT.md
+frontend/DESIGN.md
+.agents/
+skills-lock.json
+.impeccable/
+PRODUCT.md
+DESIGN.md
