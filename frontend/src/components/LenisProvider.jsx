@@ -26,10 +26,7 @@ export function LenisProvider({ children }) {
 
     lenis.on('scroll', ScrollTrigger.update);
 
-    const onLenisScroll = () => {
-      window.dispatchEvent(new Event('scroll'));
-    };
-    lenis.on('scroll', onLenisScroll);
+    // Removed window.dispatchEvent('scroll') to prevent infinite recursion with Lenis's native scroll listener
 
     const tick = (time) => {
       lenis.raf(time * 1000);
@@ -38,7 +35,6 @@ export function LenisProvider({ children }) {
     gsap.ticker.lagSmoothing(0);
 
     return () => {
-      lenis.off('scroll', onLenisScroll);
       gsap.ticker.remove(tick);
       lenis.destroy();
       lenisRef.current = null;
