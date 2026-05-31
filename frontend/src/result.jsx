@@ -304,7 +304,71 @@ export default function ResultPage({ token, theme }) {
                   </div>
                 </div>
 
-                {/* ── Card 3: Cleanup actions ── */}
+                {/* ── Card 3: Data Score before/after ── */}
+                {result.visualization_data.raw_score != null && (
+                  <div className="rp-viz-card" onMouseMove={handleCardMouseMove} onMouseLeave={handleCardMouseLeave}>
+                    <div className="rp-viz-header">
+                      <div className="rp-viz-title">Data score</div>
+                      <div
+                        className={`rp-viz-badge ${result.visualization_data.score_delta >= 0 ? 'rp-viz-badge-green' : 'rp-viz-badge-amber'}`}
+                      >
+                        {result.visualization_data.score_delta >= 0 ? '+' : ''}{result.visualization_data.score_delta}pts
+                      </div>
+                    </div>
+
+                    <div className="rp-neon-bar-group" style={{ marginTop: 0 }}>
+                      {/* Before score */}
+                      <div className="rp-neon-bar-item">
+                        <div className="rp-neon-bar-top">
+                          <span className="rp-neon-bar-label">Before score</span>
+                          <span className="rp-neon-bar-val">{result.visualization_data.raw_score}%</span>
+                        </div>
+                        <div className="rp-neon-bar-track">
+                          <div
+                            className="rp-neon-bar-fill"
+                            style={{
+                              width: `${Math.max(result.visualization_data.raw_score, 3)}%`,
+                              background: 'linear-gradient(90deg, var(--amber), #ff6b35)',
+                              color: 'var(--amber)',
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* After score */}
+                      <div className="rp-neon-bar-item">
+                        <div className="rp-neon-bar-top">
+                          <span className="rp-neon-bar-label">After score</span>
+                          <span className="rp-neon-bar-val" style={{ color: 'var(--green)' }}>{result.visualization_data.cleaned_score}%</span>
+                        </div>
+                        <div className="rp-neon-bar-track">
+                          <div
+                            className="rp-neon-bar-fill"
+                            style={{
+                              width: `${Math.max(result.visualization_data.cleaned_score, 3)}%`,
+                              background: 'linear-gradient(90deg, var(--green), #00e5ff)',
+                              color: 'var(--green)',
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Score change label */}
+                    <div style={{
+                      fontSize: '12px',
+                      color: result.visualization_data.score_delta >= 0 ? 'var(--green)' : 'var(--amber)',
+                      fontFamily: "'Inter', sans-serif",
+                      fontWeight: 500,
+                      marginTop: '-4px',
+                    }}>
+                      Score change: {result.visualization_data.score_delta >= 0 ? '+' : ''}{result.visualization_data.score_delta} points after cleaning.
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Card 4: Cleanup actions ── */}
+
                 <div className="rp-viz-card rp-viz-card-full" onMouseMove={handleCardMouseMove} onMouseLeave={handleCardMouseLeave}>
                   <div className="rp-viz-header">
                     <div className="rp-viz-title">Cleanup actions</div>

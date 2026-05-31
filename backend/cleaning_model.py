@@ -11,7 +11,7 @@ from statistics import median
 from typing import Any
 
 # ── OpenRouter config ─────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "s-or-v1-b4e8258c46af86fc43d8467fb95d36f7b12d384149be7f191b7ad64a459e0f5f")
 OPENROUTER_MODEL = "gpt-oss-120b:free"
 OPENROUTER_TIMEOUT   = 15       # seconds per HTTP call
 OPENROUTER_RETRIES   = 2        # retries on 429
