@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from flask_cors import CORS
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_file, url_for
+import pandas as pd
 
 from cleaning_model import CSVCleaningModel
 from query_assistant import DataQueryAssistant, QueryResult
@@ -54,6 +55,37 @@ def create_app() -> Flask:
         row_retained_percent = round((cleaning_result.cleaned_row_count / row_base) * 100, 1)
         column_retained_percent = round((cleaning_result.cleaned_column_count / column_base) * 100, 1)
 
+        def calculate_score(csv_text: str) -> float:
+            if not csv_text.strip():
+                return 0.0
+            try:
+                df = pd.read_csv(io.StringIO(csv_text), dtype=str, keep_default_na=False)
+            except Exception:
+                return 0.0
+
+            if df.empty:
+                return 0.0
+
+            normalized = df.fillna("").astype(str).apply(lambda column: column.str.strip())
+            total_cells = int(normalized.shape[0] * normalized.shape[1])
+            if total_cells == 0:
+                return 0.0
+
+            filled_cells = int(normalized.ne("").sum().sum())
+            completeness = filled_cells / total_cells
+
+            non_empty_rows = int(normalized.ne("").any(axis=1).sum())
+            row_utilization = non_empty_rows / max(len(normalized), 1)
+
+            duplicate_rows = int(normalized.duplicated().sum())
+            uniqueness = 1 - (duplicate_rows / max(len(normalized), 1))
+
+            score = ((completeness * 0.5) + (row_utilization * 0.25) + (uniqueness * 0.25)) * 100
+            return round(max(0.0, min(100.0, score)), 1)
+
+        raw_score = calculate_score(getattr(cleaning_result, "raw_csv_text", ""))
+        cleaned_score = calculate_score(cleaning_result.cleaned_csv_text)
+
         action_values = [
             cleaning_result.removed_empty_rows,
             cleaning_result.removed_duplicate_rows,
@@ -70,6 +102,21 @@ def create_app() -> Flask:
             "row_removed_percent": round(100 - row_retained_percent, 1),
             "column_retained_percent": column_retained_percent,
             "column_removed_percent": round(100 - column_retained_percent, 1),
+            "raw_score": raw_score,
+            "cleaned_score": cleaned_score,
+            "score_delta": round(cleaned_score - raw_score, 1),
+            "score_cards": [
+                {
+                    "label": "Before score",
+                    "value": raw_score,
+                    "width": raw_score,
+                },
+                {
+                    "label": "After score",
+                    "value": cleaned_score,
+                    "width": cleaned_score,
+                },
+            ],
             "action_cards": [
                 {
                     "label": "Empty rows removed",

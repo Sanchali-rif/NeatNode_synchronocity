@@ -67,6 +67,25 @@
 
         <article class="viz-card">
           <div class="viz-card-head">
+            <h2>Data score</h2>
+            <strong>{{ visualization_data.cleaned_score }}%</strong>
+          </div>
+          <div class="viz-bars viz-bars-tight">
+            {% for item in visualization_data.score_cards %}
+            <div class="viz-series">
+              <div class="viz-series-head">
+                <span>{{ item.label }}</span>
+                <strong>{{ item.value }}%</strong>
+              </div>
+              <div class="viz-track"><span class="viz-fill viz-fill-action" style="width: {{ item.width }}%;"></span></div>
+            </div>
+            {% endfor %}
+          </div>
+          <p class="viz-caption">Score change: {{ '+' if visualization_data.score_delta >= 0 else '' }}{{ visualization_data.score_delta }} points after cleaning.</p>
+        </article>
+
+        <article class="viz-card">
+          <div class="viz-card-head">
             <h2>Cleanup actions</h2>
             <strong>{{ cleaning_result.removed_empty_rows + cleaning_result.removed_duplicate_rows + cleaning_result.removed_outlier_rows }}</strong>
           </div>

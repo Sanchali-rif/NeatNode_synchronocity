@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import os
 import re
 import time
 import urllib.error
@@ -10,7 +11,7 @@ from statistics import median
 from typing import Any
 
 # ── OpenRouter config ─────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = "process.env.OPENROUTER_API_KEY"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "gpt-oss-120b:free"
 OPENROUTER_TIMEOUT   = 15       # seconds per HTTP call
 OPENROUTER_RETRIES   = 2        # retries on 429
@@ -23,6 +24,7 @@ OPENROUTER_COOLDOWN  = 12       # seconds cooldown after exhausting retries
 @dataclass
 class CleaningSummary:
     filename: str
+    raw_csv_text: str
     raw_headers: list[str]
     cleaned_headers: list[str]
     raw_column_count: int
@@ -179,6 +181,10 @@ class CSVCleaningModel:
         if not rows:
             raise ValueError("CSV file is empty.")
 
+        raw_buffer = io.StringIO()
+        csv.writer(raw_buffer).writerows(rows)
+        raw_csv_text = raw_buffer.getvalue()
+
         raw_headers = [h.strip() for h in rows[0]]
         data_rows   = rows[1:] if len(rows) > 1 else []
         col_count   = max([len(rows[0])] + [len(r) for r in data_rows])
@@ -284,6 +290,7 @@ class CSVCleaningModel:
 
         return CleaningSummary(
             filename             = file_storage.filename,
+            raw_csv_text         = raw_csv_text,
             raw_headers          = f_raw_hdr,
             cleaned_headers      = f_clean_hdr,
             raw_column_count     = len(rows[0]),
