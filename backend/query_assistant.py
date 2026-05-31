@@ -1,7 +1,6 @@
 from __future__ import annotations
  
 import json
-import os
 import re
 import sqlite3
 import time
@@ -11,7 +10,7 @@ from dataclasses import dataclass, field
  
 # ── OpenRouter config (shared with cleaning_model) ─────────────────────────
 # Keep this in sync with cleaning_model.py — or move to a shared config.py
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = "process.env.OPENROUTER_API_KEY"
 OPENROUTER_MODEL = "gpt-oss-120b:free"
 OPENROUTER_TIMEOUT   = 15
 OPENROUTER_RETRIES   = 2

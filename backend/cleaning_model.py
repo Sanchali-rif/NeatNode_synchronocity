@@ -2,7 +2,6 @@ import csv
 import io
 import json
 import re
-import os
 import time
 import urllib.error
 import urllib.request
@@ -11,7 +10,7 @@ from statistics import median
 from typing import Any
 
 # ── OpenRouter config ─────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = "process.env.OPENROUTER_API_KEY"
 OPENROUTER_MODEL = "gpt-oss-120b:free"
 OPENROUTER_TIMEOUT   = 15       # seconds per HTTP call
 OPENROUTER_RETRIES   = 2        # retries on 429
