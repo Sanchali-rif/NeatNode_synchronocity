@@ -1,13 +1,24 @@
 import csv
 import io
 import json
-import os
 import re
+import os
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import median
 from typing import Any
+
+# ── OpenRouter config ─────────────────────────────────────────────────────────
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "gpt-oss-120b:free"
+OPENROUTER_TIMEOUT   = 15       # seconds per HTTP call
+OPENROUTER_RETRIES   = 2        # retries on 429
+OPENROUTER_BACKOFF   = 2        # seconds between retries
+OPENROUTER_COOLDOWN  = 12       # seconds cooldown after exhausting retries
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -29,6 +40,7 @@ class CleaningSummary:
     cleaned_rows: list[list[str]]
     preview_rows: list[list[str]]
     cleaned_csv_text: str
+    ai_review_error: str | None = None
 
 
 @dataclass
@@ -36,713 +48,1296 @@ class PromptPreferences:
     remove_empty_rows: bool = True
     remove_duplicate_rows: bool = True
     remove_outlier_rows: bool = True
-    fill_strategy: str | None = None
+    fill_strategy: str | None = None          # null|zero|mode|median|literal|auto
     fill_value: str | None = None
+    column_fill_values: dict[str, str] | None = None
     treat_missing_as_blank: bool = True
     drop_columns: list[str] | None = None
     keep_columns: list[str] | None = None
+    arithmetic_columns: list[dict] | None = None  # [{column, operation, value}]
+    value_replacements: list[dict] | None = None   # [{column, from, to}]
+    swap_columns: list[dict] | None = None         # [{left, right}]
     prompt_summary: str | None = None
 
 
-class CSVCleaningModel:
-    EMPTY_MARKERS = {"", "na", "n/a", "null", "none", "-", "--"}
+# ── Tiny HTTP helper ──────────────────────────────────────────────────────────
 
-    def clean_upload(self, file_storage, prompt: str | None = None) -> CleaningSummary:
-        stream = io.TextIOWrapper(file_storage.stream, encoding="utf-8-sig", newline="")
-        reader = csv.reader(stream)
-        rows = list(reader)
+class _OpenRouterClient:
+    """Minimal OpenRouter REST client with retry + cooldown logic."""
 
-        if not rows:
-            raise ValueError("CSV file is empty.")
+    def __init__(self) -> None:
+        self._cooldown_until: float = 0.0
 
-        raw_headers = [header.strip() for header in rows[0]]
-        data_rows = rows[1:] if len(rows) > 1 else []
-
-        column_count = max([len(rows[0])] + [len(row) for row in data_rows])
-        padded_headers = self._pad_row(raw_headers, column_count)
-        cleaned_headers = self._normalize_headers(padded_headers)
-
-        preferences = self._parse_prompt_preferences(prompt, raw_headers, cleaned_headers)
-
-        drop_requests = list(preferences.drop_columns or [])
-        keep_requests = list(preferences.keep_columns or [])
-        drop_indices, dropped_headers = self._resolve_drop_columns(raw_headers, cleaned_headers, drop_requests)
-        protected_drop_indices, _ = self._resolve_drop_columns(raw_headers, cleaned_headers, keep_requests)
-        if protected_drop_indices:
-            drop_indices = [index for index in drop_indices if index not in protected_drop_indices]
-        kept_indices = [index for index in range(column_count) if index not in drop_indices]
-        filtered_raw_headers = [raw_headers[index] for index in kept_indices]
-        filtered_cleaned_headers = [cleaned_headers[index] for index in kept_indices]
-        dropped_headers = [cleaned_headers[index] for index in drop_indices]
-
-        column_profiles = self._build_column_profiles(filtered_cleaned_headers, data_rows, kept_indices)
-
-        cleaned_rows: list[list[str]] = []
-        seen_rows: set[tuple[str, ...]] = set()
-        removed_empty_rows = 0
-        removed_duplicate_rows = 0
-        removed_outlier_rows = 0
-
-        imputation_summary: list[dict[str, object]] = []
-
-        for row in data_rows:
-            padded_row = self._pad_row(row, column_count)
-            cleaned_row = [self._clean_cell(padded_row[index], preferences=preferences) for index in kept_indices]
-
-            if preferences.remove_empty_rows and all(cell == "" for cell in cleaned_row):
-                removed_empty_rows += 1
-                continue
-
-            for index, value in enumerate(cleaned_row):
-                current_header = filtered_cleaned_headers[index]
-                if self._is_protected_column(current_header, preferences):
-                    continue
-                if value == "":
-                    cleaned_row[index] = self._resolve_fill_value(column_profiles[index], preferences)
-                    column_profiles[index]["filled_count"] = int(column_profiles[index]["filled_count"]) + 1
-
-            outlier_columns = self._find_outlier_columns(cleaned_row, column_profiles)
-            if preferences.remove_outlier_rows and outlier_columns:
-                removed_outlier_rows += 1
-                for column_name in outlier_columns:
-                    for profile in column_profiles:
-                        if profile["column_name"] == column_name:
-                            profile["outlier_count"] = int(profile["outlier_count"]) + 1
-                            break
-                continue
-
-            row_key = tuple(cleaned_row)
-            if preferences.remove_duplicate_rows and row_key in seen_rows:
-                removed_duplicate_rows += 1
-                continue
-
-            seen_rows.add(row_key)
-            cleaned_rows.append(cleaned_row)
-
-        for profile in column_profiles:
-            if profile["filled_count"] > 0:
-                imputation_summary.append(
-                    {
-                        "column": profile["column_name"],
-                        "strategy": profile["strategy"],
-                        "fill_value": profile["fill_value"],
-                        "filled_count": profile["filled_count"],
-                    }
-                )
-
-        summary_notes = self._build_summary_notes(
-            removed_empty_rows=removed_empty_rows,
-            removed_duplicate_rows=removed_duplicate_rows,
-            removed_outlier_rows=removed_outlier_rows,
-            column_profiles=column_profiles,
-            prompt=prompt,
-            preferences=preferences,
-            dropped_headers=dropped_headers,
-        )
-
-        ai_summary = None
-        ai_notes = self._get_gemini_review(
-            filename=file_storage.filename,
-            prompt=prompt,
-            raw_headers=filtered_raw_headers,
-            cleaned_headers=filtered_cleaned_headers,
-            column_profiles=column_profiles,
-            summary_notes=summary_notes,
-            preview_rows=cleaned_rows[:3],
-        )
-        if ai_notes:
-            ai_summary = ai_notes.get("headline")
-            for note in ai_notes.get("notes", []):
-                if note and note not in summary_notes:
-                    summary_notes.append(note)
-            for note in ai_notes.get("next_steps", []):
-                if note and note not in summary_notes:
-                    summary_notes.append(f"Next step: {note}")
-        if not ai_summary:
-            action_bits: list[str] = []
-            if removed_outlier_rows:
-                action_bits.append(f"removed {removed_outlier_rows} outlier row{'s' if removed_outlier_rows != 1 else ''}")
-            if removed_duplicate_rows:
-                action_bits.append(f"deduplicated {removed_duplicate_rows} row{'s' if removed_duplicate_rows != 1 else ''}")
-            if removed_empty_rows:
-                action_bits.append(f"dropped {removed_empty_rows} empty row{'s' if removed_empty_rows != 1 else ''}")
-            if not action_bits:
-                action_bits.append("normalized headers")
-            ai_summary = f"Built-in review: {', '.join(action_bits)} and prepared the cleaned CSV."
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(filtered_cleaned_headers)
-        writer.writerows(cleaned_rows)
-
-        return CleaningSummary(
-            filename=file_storage.filename,
-            raw_headers=filtered_raw_headers,
-            cleaned_headers=filtered_cleaned_headers,
-            raw_column_count=len(rows[0]),
-            cleaned_column_count=len(filtered_cleaned_headers),
-            raw_row_count=len(data_rows),
-            cleaned_row_count=len(cleaned_rows),
-            removed_empty_rows=removed_empty_rows,
-            removed_duplicate_rows=removed_duplicate_rows,
-            removed_outlier_rows=removed_outlier_rows,
-            imputation_summary=imputation_summary,
-            summary_notes=summary_notes,
-            ai_summary=ai_summary,
-            prompt_used=prompt or None,
-            cleaned_rows=cleaned_rows,
-            preview_rows=cleaned_rows[:3],
-            cleaned_csv_text=output.getvalue(),
-        )
-
-    def _pad_row(self, row: list[str], target_length: int) -> list[str]:
-        padded_row = list(row[:target_length])
-        if len(padded_row) < target_length:
-            padded_row.extend([""] * (target_length - len(padded_row)))
-        return padded_row
-
-    def _normalize_headers(self, headers: list[str]) -> list[str]:
-        normalized_headers: list[str] = []
-        seen_counts: dict[str, int] = {}
-
-        for index, header in enumerate(headers, start=1):
-            candidate = re.sub(r"[^a-z0-9]+", "_", header.strip().lower()).strip("_")
-            if not candidate:
-                candidate = f"column_{index}"
-
-            count = seen_counts.get(candidate, 0)
-            seen_counts[candidate] = count + 1
-            if count:
-                candidate = f"{candidate}_{count + 1}"
-
-            normalized_headers.append(candidate)
-
-        return normalized_headers
-
-    def _clean_cell(self, value: str, preferences: PromptPreferences | None = None) -> str:
-        cleaned_value = re.sub(r"\s+", " ", value.strip())
-        if cleaned_value.lower() in self.EMPTY_MARKERS:
-            return ""
-        return cleaned_value
-
-    def _is_protected_column(self, column_name: str, preferences: PromptPreferences) -> bool:
-        protected_columns = list(preferences.keep_columns or [])
-        normalized_column = self._normalize_prompt_text(column_name)
-        for protected in protected_columns:
-            normalized_protected = self._normalize_prompt_text(protected)
-            if normalized_protected and (normalized_protected == normalized_column or normalized_protected in normalized_column or normalized_column in normalized_protected):
-                return True
-        return False
-
-    def _parse_prompt_preferences(self, prompt: str | None, raw_headers: list[str] | None = None, cleaned_headers: list[str] | None = None) -> PromptPreferences:
-        preferences = PromptPreferences()
-        if not prompt:
-            return preferences
-
-        ai_preferences = self._interpret_prompt_with_gemini(prompt)
-        if ai_preferences:
-            preferences = ai_preferences
-
-        text = prompt.lower()
-        keep_terms = self._extract_keep_column_terms(text)
-        drop_terms = self._extract_drop_column_terms(text)
-        if raw_headers and cleaned_headers:
-            drop_terms.extend(self._extract_headers_from_prompt(prompt, raw_headers, cleaned_headers))
-        if drop_terms:
-            existing_drop_columns = list(preferences.drop_columns or [])
-            existing_drop_columns.extend(drop_terms)
-            preferences.drop_columns = list(dict.fromkeys(existing_drop_columns))
-        if keep_terms:
-            existing_keep_columns = list(preferences.keep_columns or [])
-            existing_keep_columns.extend(keep_terms)
-            preferences.keep_columns = list(dict.fromkeys(existing_keep_columns))
-        if any(phrase in text for phrase in ["keep duplicates", "do not remove duplicates", "don't remove duplicates", "preserve duplicates"]):
-            preferences.remove_duplicate_rows = False
-        if any(phrase in text for phrase in ["keep outlier", "do not remove outliers", "don't remove outliers", "preserve outliers"]):
-            preferences.remove_outlier_rows = False
-        if any(phrase in text for phrase in ["keep empty rows", "do not remove empty rows", "don't remove empty rows", "preserve empty rows"]):
-            preferences.remove_empty_rows = False
-
-        if any(
-            phrase in text
-            for phrase in [
-                "fill with zero",
-                "use zero",
-                "replace missing with 0",
-                "fill with 0",
-                "fill null with 0",
-                "fill nulls with 0",
-                "fill the null value with 0",
-                "fill the null values with 0",
-                "fill all null value with 0",
-                "fill all null values with 0",
-                "fill all the null value with 0",
-                "fill all the null values with 0",
-                "replace null with 0",
-                "replace nulls with 0",
-                "set null to 0",
-            ]
-        ):
-            preferences.fill_strategy = "zero"
-            preferences.fill_value = "0"
-        elif any(phrase in text for phrase in ["use mode", "fill with mode", "mode for missing"]):
-            preferences.fill_strategy = "mode"
-        elif any(phrase in text for phrase in ["use median", "fill with median", "median for missing"]):
-            preferences.fill_strategy = "median"
-
-        explicit_fill = re.search(
-            r"(?:fill|replace|set)[\s\w]*?(?:null|missing|blank|na|n/a)[\s\w]*?(?:with|to)\s+([a-z0-9_.-]+)",
-            text,
-        )
-        if explicit_fill:
-            preferences.fill_strategy = "literal"
-            preferences.fill_value = explicit_fill.group(1)
-
-        if any(phrase in text for phrase in ["keep blanks", "leave blanks", "do not fill missing", "don't fill missing", "keep nulls", "leave nulls"]):
-            preferences.treat_missing_as_blank = False
-
-        if preferences.keep_columns:
-            preferences.treat_missing_as_blank = True
-
-        if preferences.prompt_summary:
-            preferences.prompt_summary = preferences.prompt_summary.strip()
-
-        return preferences
-
-    def _interpret_prompt_with_gemini(self, prompt: str) -> PromptPreferences | None:
-        api_key = "AIzaSyBGgy_bd1yFo424PiDwcnycjJzaX3bv1wE"
+    def call(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str | None:
+        """Send *prompt* to OpenRouter; return raw text or None on failure."""
+        api_key = OPENROUTER_API_KEY
         if not api_key:
+            print("[OpenRouter] API key not configured.")
             return None
 
-        model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-        instruction = (
-            "Convert the user's data-cleaning request into strict JSON only. "
-            "Return keys: remove_empty_rows (bool), remove_duplicate_rows (bool), remove_outlier_rows (bool), "
-            "fill_strategy (one of: null, zero, mode, median, literal, auto), fill_value (string or null), "
-            "drop_columns (array of exact column names or phrases), and prompt_summary (short string). "
-            "If the request says to remove a column, include it in drop_columns. "
-            "If it says to fill missing values with a specific value, set fill_strategy to literal and put that value in fill_value. "
-            "If it says to fill missing values with zero, set fill_strategy to zero and fill_value to 0. "
-            "If it says to use the best approach, choose auto. "
-            "If it says to keep something, set the relevant remove_* flag to false. "
-            "Do not include markdown or extra commentary.\n\n"
-            f"User request: {prompt}"
-        )
-
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": instruction}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 256,
-                "responseMimeType": "application/json",
-            },
-        }
-
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        now = time.time()
+        if now < self._cooldown_until:
+            remaining = int(self._cooldown_until - now)
+            print(f"[OpenRouter] Cooldown active — {remaining}s remaining.")
             return None
 
-        candidates = response_payload.get("candidates", [])
-        if not candidates:
-            return None
-
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
-        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-        if not text:
-            return None
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
-                return None
-            try:
-                parsed = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                return None
-
-        preferences = PromptPreferences()
-        preferences.remove_empty_rows = bool(parsed.get("remove_empty_rows", True))
-        preferences.remove_duplicate_rows = bool(parsed.get("remove_duplicate_rows", True))
-        preferences.remove_outlier_rows = bool(parsed.get("remove_outlier_rows", True))
-        fill_strategy = parsed.get("fill_strategy")
-        if fill_strategy in {"zero", "mode", "median", "literal", "auto"}:
-            preferences.fill_strategy = str(fill_strategy)
-        fill_value = parsed.get("fill_value")
-        if isinstance(fill_value, str) and fill_value.strip():
-            preferences.fill_value = fill_value.strip()
-        drop_columns = parsed.get("drop_columns")
-        if isinstance(drop_columns, list):
-            preferences.drop_columns = [str(item) for item in drop_columns if str(item).strip()]
-        preferences.prompt_summary = str(parsed.get("prompt_summary") or prompt[:120]).strip() or None
-        return preferences
-
-    def _extract_headers_from_prompt(self, prompt: str, raw_headers: list[str], cleaned_headers: list[str]) -> list[str]:
-        prompt_text = self._normalize_prompt_text(prompt)
-        requested_headers: list[str] = []
-
-        for header in list(raw_headers) + list(cleaned_headers):
-            normalized_header = self._normalize_prompt_text(header)
-            if not normalized_header:
-                continue
-
-            if normalized_header in prompt_text:
-                requested_headers.append(header)
-
-        return list(dict.fromkeys(requested_headers))
-
-    def _extract_keep_column_terms(self, prompt_text: str) -> list[str]:
-        column_terms: list[str] = []
-        keep_patterns = [
-            r"(?:don'?t\s+remove|do\s+not\s+remove|dont\s+remove|keep|preserve|remain\s+unchanged|leave)\s+(?:the\s+)?([a-z0-9_\- ,&/]+?)\s*(?:column|columns|col|cols|field|fields|unchanged|intact|as\s+is|remain|stay|please|plz|do\s+not\s+fill|don'?t\s+fill|dont\s+fill)?(?:$|[.,;])",
-            r"(?:do\s+not\s+fill|don'?t\s+fill|dont\s+fill|leave)\s+(?:the\s+)?([a-z0-9_\- ,&/]+?)\s*(?:column|columns|col|cols|field|fields|blank|empty|unchanged|intact|as\s+is|please|plz)?(?:$|[.,;])",
-        ]
-
-        for pattern in keep_patterns:
-            for match in re.finditer(pattern, prompt_text):
-                phrase = match.group(1)
-                phrase = re.sub(r"\b(column|columns|col|cols|field|fields|from|the|a|an|and|please|plz|anything|anything\s+to)\b", " ", phrase)
-                for term in re.split(r"[,/&]+|\band\b", phrase):
-                    candidate = re.sub(r"[^a-z0-9]+", " ", term).strip()
-                    if candidate:
-                        column_terms.append(candidate)
-
-        return list(dict.fromkeys(column_terms))
-
-    def _normalize_prompt_text(self, text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-    def _extract_drop_column_terms(self, prompt_text: str) -> list[str]:
-        column_terms: list[str] = []
-        for match in re.finditer(r"(?:remove|drop|delete|exclude|ignore|eliminate)\s+(?:the\s+)?([a-z0-9_\- ,&/]+)", prompt_text):
-            phrase = match.group(1)
-            phrase = re.sub(r"\b(column|columns|col|cols|field|fields|from|the|a|an|and|please)\b", " ", phrase)
-            for term in re.split(r"[,/&]+|\band\b", phrase):
-                candidate = re.sub(r"[^a-z0-9]+", " ", term).strip()
-                if candidate:
-                    column_terms.append(candidate)
-
-        return list(dict.fromkeys(column_terms))
-
-    def _resolve_drop_columns(self, raw_headers: list[str], cleaned_headers: list[str], requested_terms: list[str]) -> tuple[list[int], list[str]]:
-        if not requested_terms:
-            return [], []
-
-        drop_indices: list[int] = []
-        dropped_headers: list[str] = []
-        normalized_raw = [re.sub(r"[^a-z0-9]+", " ", header.lower()).strip() for header in raw_headers]
-        normalized_clean = [re.sub(r"[^a-z0-9]+", " ", header.lower()).strip() for header in cleaned_headers]
-
-        for index, (raw_name, clean_name) in enumerate(zip(normalized_raw, normalized_clean)):
-            for term in requested_terms:
-                normalized_term = re.sub(r"[^a-z0-9]+", " ", term.lower()).strip()
-                if not normalized_term:
-                    continue
-                if (
-                    normalized_term == raw_name
-                    or normalized_term == clean_name
-                    or normalized_term in raw_name
-                    or normalized_term in clean_name
-                    or raw_name in normalized_term
-                    or clean_name in normalized_term
-                ):
-                    if index not in drop_indices:
-                        drop_indices.append(index)
-                        dropped_headers.append(cleaned_headers[index])
-                    break
-
-        return drop_indices, dropped_headers
-
-    def _resolve_fill_value(self, profile: dict[str, object], preferences: PromptPreferences) -> str:
-        if not preferences.treat_missing_as_blank:
-            return ""
-
-        if preferences.fill_strategy == "literal" and preferences.fill_value is not None:
-            return preferences.fill_value
-
-        strategy = preferences.fill_strategy or str(profile["strategy"])
-        if strategy == "zero":
-            return "0"
-        if strategy == "auto":
-            strategy = str(profile["strategy"])
-        if strategy == "mode":
-            return self._mode(list(profile.get("sample_values", []))) or "Unknown"
-        if strategy == "median" and profile.get("is_numeric"):
-            sample_values = list(profile.get("sample_values", []))
-            numeric_values = self._extract_numeric_values(sample_values)
-            if numeric_values:
-                return self._format_number(median(numeric_values))
-        return str(profile["fill_value"])
-
-    def _build_column_profiles(self, cleaned_headers: list[str], data_rows: list[list[str]], kept_indices: list[int]) -> list[dict[str, object]]:
-        profiles: list[dict[str, object]] = []
-
-        for profile_index, source_index in enumerate(kept_indices):
-            values: list[str] = []
-            for row in data_rows:
-                padded_row = self._pad_row(row, max(kept_indices) + 1 if kept_indices else 0)
-                cleaned_value = self._clean_cell(padded_row[source_index])
-                if cleaned_value != "":
-                    values.append(cleaned_value)
-
-            numeric_values = self._extract_numeric_values(values)
-            is_numeric = bool(numeric_values) and len(numeric_values) == len(values)
-            if numeric_values and len(numeric_values) == len(values):
-                fill_value = self._format_number(median(numeric_values)) if numeric_values else "0"
-                strategy = "median"
-                outlier_min, outlier_max = self._calculate_outlier_bounds(numeric_values)
-            else:
-                fill_value = self._mode(values) or "Unknown"
-                strategy = "mode"
-                outlier_min = None
-                outlier_max = None
-
-            profiles.append(
-                {
-                    "column_name": cleaned_headers[profile_index],
-                    "strategy": strategy,
-                    "fill_value": fill_value,
-                    "filled_count": 0,
-                    "is_numeric": is_numeric,
-                    "outlier_min": outlier_min,
-                    "outlier_max": outlier_max,
-                    "outlier_count": 0,
-                    "non_empty_count": len(values),
-                    "sample_values": values[:5],
-                }
-            )
-
-        return profiles
-
-    def _calculate_outlier_bounds(self, numeric_values: list[float]) -> tuple[float | None, float | None]:
-        if len(numeric_values) < 4:
-            return None, None
-
-        ordered = sorted(numeric_values)
-        midpoint = len(ordered) // 2
-        if len(ordered) % 2 == 0:
-            lower_half = ordered[:midpoint]
-            upper_half = ordered[midpoint:]
-        else:
-            lower_half = ordered[:midpoint]
-            upper_half = ordered[midpoint + 1 :]
-
-        if not lower_half or not upper_half:
-            return None, None
-
-        q1 = median(lower_half)
-        q3 = median(upper_half)
-        iqr = q3 - q1
-        if iqr <= 0:
-            return None, None
-
-        return q1 - 1.5 * iqr, q3 + 1.5 * iqr
-
-    def _find_outlier_columns(self, row: list[str], column_profiles: list[dict[str, object]]) -> list[str]:
-        outlier_columns: list[str] = []
-
-        for index, profile in enumerate(column_profiles):
-            lower = profile.get("outlier_min")
-            upper = profile.get("outlier_max")
-            if lower is None or upper is None:
-                continue
-
-            try:
-                value = float(row[index])
-            except (ValueError, TypeError):
-                continue
-
-            if value < float(lower) or value > float(upper):
-                outlier_columns.append(str(profile["column_name"]))
-
-        return outlier_columns
-
-    def _build_summary_notes(
-        self,
-        *,
-        removed_empty_rows: int,
-        removed_duplicate_rows: int,
-        removed_outlier_rows: int,
-        column_profiles: list[dict[str, object]],
-        prompt: str | None,
-        preferences: PromptPreferences,
-        dropped_headers: list[str],
-    ) -> list[str]:
-        notes: list[str] = []
-
-        preference_notes: list[str] = []
-        if prompt:
-            preference_notes.append(f"Prompt received: {prompt}")
-        if preferences.prompt_summary:
-            preference_notes.append(f"Interpreted prompt: {preferences.prompt_summary}.")
-        if not preferences.remove_duplicate_rows:
-            preference_notes.append("Prompt kept duplicate rows in the cleaned output.")
-        if not preferences.remove_outlier_rows:
-            preference_notes.append("Prompt kept numeric outliers in the cleaned output.")
-        if not preferences.remove_empty_rows:
-            preference_notes.append("Prompt kept empty rows in the cleaned output.")
-        if preferences.fill_strategy:
-            preference_notes.append(f"Prompt requested {preferences.fill_strategy} for missing-value handling.")
-        if dropped_headers:
-            preference_notes.append(f"Prompt removed columns: {', '.join(dropped_headers)}.")
-
-        notes.extend(preference_notes)
-
-        if removed_empty_rows:
-            notes.append(f"Removed {removed_empty_rows} empty row{'s' if removed_empty_rows != 1 else ''}.")
-
-        if removed_duplicate_rows:
-            notes.append(f"Removed {removed_duplicate_rows} duplicate row{'s' if removed_duplicate_rows != 1 else ''}.")
-
-        if removed_outlier_rows:
-            notes.append(f"Removed {removed_outlier_rows} row{'s' if removed_outlier_rows != 1 else ''} with numeric outliers.")
-
-        filled_columns = [profile for profile in column_profiles if int(profile["filled_count"]) > 0]
-        if filled_columns:
-            filled_text = ", ".join(str(profile["column_name"]) for profile in filled_columns[:4])
-            if len(filled_columns) > 4:
-                filled_text = f"{filled_text}, and {len(filled_columns) - 4} more"
-            notes.append(f"Filled missing values in {filled_text} using column-specific median or mode strategies.")
-
-        if not notes:
-            notes.append("No cleaning issues were detected beyond header normalization.")
-
-        return notes
-
-    def _get_gemini_review(
-        self,
-        *,
-        filename: str | None,
-        prompt: str | None,
-        raw_headers: list[str],
-        cleaned_headers: list[str],
-        column_profiles: list[dict[str, object]],
-        summary_notes: list[str],
-        preview_rows: list[list[str]],
-    ) -> dict[str, Any] | None:
-        api_key = "AIzaSyBGgy_bd1yFo424PiDwcnycjJzaX3bv1wE"
-        if not api_key:
-            return None
-
-        model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-        profile_payload = {
-            "filename": filename,
-            "raw_headers": raw_headers,
-            "cleaned_headers": cleaned_headers,
-            "columns": [
-                {
-                    "name": profile["column_name"],
-                    "strategy": profile["strategy"],
-                    "fill_value": profile["fill_value"],
-                    "filled_count": profile["filled_count"],
-                    "outlier_count": profile["outlier_count"],
-                    "sample_values": profile["sample_values"],
-                }
-                for profile in column_profiles
+        payload = json.dumps({
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON when asked for structured output."},
+                {"role": "user", "content": prompt},
             ],
-            "summary_notes": summary_notes,
-            "preview_rows": preview_rows,
-        }
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }).encode("utf-8")
 
-        user_prompt = prompt.strip() if prompt else ""
-        instruction = (
-            "You are a senior data cleaning assistant. Review the dataset profile and the cleaning actions already applied. "
-            "The user prompt is optional; if it exists, prioritize it. Return strict JSON only with these keys: "
-            "headline (short sentence), notes (array of 3 to 6 concise notes), and next_steps (array of 0 to 3 short suggestions). "
-            "Make sure the notes mention missing values, outliers, duplicates, and header normalization when relevant. "
-            "Do not include markdown, code fences, or commentary outside the JSON object.\n\n"
-            f"User prompt: {user_prompt or 'No user prompt was provided.'}\n\n"
-            f"Dataset profile: {json.dumps(profile_payload, ensure_ascii=False, indent=2)}"
-        )
-
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": instruction}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 512,
-                "responseMimeType": "application/json",
-            },
-        }
-
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                response_payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
-            return None
-
-        candidates = response_payload.get("candidates", [])
-        if not candidates:
-            return None
-
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
-        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-        if not text:
-            return None
-
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        for attempt in range(OPENROUTER_RETRIES + 1):
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "NeatNode Synchronocity",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                text = (
+                    body.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                ).strip()
+                if text:
+                    print(f"[OpenRouter] OK via {OPENROUTER_MODEL}. Response preview: {text[:200]}")
+                    return text
+                print("[OpenRouter] Empty response.")
                 return None
+            except urllib.error.HTTPError as err:
+                if err.code == 429:
+                    if attempt < OPENROUTER_RETRIES:
+                        wait = OPENROUTER_BACKOFF * (attempt + 1)
+                        print(f"[OpenRouter] 429, retry in {wait}s …")
+                        time.sleep(wait)
+                        continue
+                    self._cooldown_until = time.time() + OPENROUTER_COOLDOWN
+                    print(f"[OpenRouter] 429 exhausted. Cooldown {OPENROUTER_COOLDOWN}s.")
+                    return None
+                print(f"[OpenRouter] HTTP {err.code}: {err.reason}")
+                return None
+            except Exception as exc:
+                print(f"[OpenRouter] Error: {exc}")
+                return None
+        return None
+
+    @staticmethod
+    def _extract_text(body: dict) -> str:
+        try:
+            parts = body["candidates"][0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+
+_openrouter = _OpenRouterClient()
+
+
+def _parse_json(raw: str | None) -> dict | None:
+    """Strip markdown fences and parse JSON; return None on failure."""
+    if not raw:
+        return None
+    text = re.sub(r"```(?:json)?|```", "", raw).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
             try:
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
-                return None
+                pass
+    print(f"[Gemini] JSON parse failed. Raw text was: {raw[:400]}")
+    return None
 
-    def _extract_numeric_values(self, values: list[str]) -> list[float]:
-        numeric_values: list[float] = []
-        for value in values:
+
+# ── Main model ────────────────────────────────────────────────────────────────
+
+class CSVCleaningModel:
+    EMPTY_MARKERS = {"", "na", "n/a", "null", "none", "-", "--", "unknown"}
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def clean_upload(self, file_storage, prompt: str | None = None) -> CleaningSummary:
+        print(f"[clean_upload] file={getattr(file_storage,'filename','?')} prompt={repr((prompt or '')[:120])}")
+
+        stream = io.TextIOWrapper(file_storage.stream, encoding="utf-8-sig", newline="")
+        reader = csv.reader(stream)
+        rows = list(reader)
+        if not rows:
+            raise ValueError("CSV file is empty.")
+
+        raw_headers = [h.strip() for h in rows[0]]
+        data_rows   = rows[1:] if len(rows) > 1 else []
+        col_count   = max([len(rows[0])] + [len(r) for r in data_rows])
+
+        padded_raw     = self._pad_row(raw_headers, col_count)
+        cleaned_headers = self._normalize_headers(padded_raw)
+
+        # ── Step 1: interpret the user prompt with OpenRouter ─────────────────
+        prefs = PromptPreferences()
+        if prompt:
+            prefs = self._interpret_prompt(prompt, raw_headers, cleaned_headers) or prefs
+            print(f"[clean_upload] Preferences after interpretation: {prefs}")
+
+        # ── Step 2: resolve column selection ─────────────────────────────────
+        drop_idx, dropped_hdr = self._resolve_columns(raw_headers, cleaned_headers, prefs.drop_columns or [])
+        keep_idx, _           = self._resolve_columns(raw_headers, cleaned_headers, prefs.keep_columns or [])
+        if keep_idx:
+            drop_idx = [i for i in drop_idx if i not in keep_idx]
+
+        kept_idx       = [i for i in range(col_count) if i not in drop_idx]
+        f_raw_hdr      = [raw_headers[i]     for i in kept_idx]
+        f_clean_hdr    = [cleaned_headers[i] for i in kept_idx]
+        dropped_labels = [cleaned_headers[i] for i in drop_idx]
+
+        if prefs.swap_columns:
+            kept_idx, f_raw_hdr, f_clean_hdr = self._apply_column_swaps_to_order(
+                kept_idx,
+                f_raw_hdr,
+                f_clean_hdr,
+                prefs.swap_columns,
+            )
+
+        profiles = self._build_column_profiles(f_clean_hdr, data_rows, kept_idx)
+
+        # ── Step 3: clean rows ────────────────────────────────────────────────
+        cleaned_rows: list[list[str]] = []
+        seen: set[tuple] = set()
+        n_empty = n_dup = n_out = 0
+        imputation_summary: list[dict] = []
+
+        for row in data_rows:
+            padded = self._pad_row(row, col_count)
+            crow   = [self._clean_cell(padded[i]) for i in kept_idx]
+            filled_mask = [False] * len(crow)
+
+            if prefs.remove_empty_rows and all(c == "" for c in crow):
+                n_empty += 1
+                continue
+
+            # fill missing
+            for idx, val in enumerate(crow):
+                col_name = f_clean_hdr[idx]
+                if val == "":
+                    crow[idx] = self._fill_value(col_name, profiles[idx], prefs)
+                    profiles[idx]["filled_count"] = int(profiles[idx]["filled_count"]) + 1
+                    filled_mask[idx] = True
+
+            # fix physically impossible values (e.g. age = -70) BEFORE arithmetic
+            crow, _ = self._apply_invalid_value_rules(crow, f_clean_hdr, profiles, prefs)
+            # re-fill any cells that were just blanked
+            for idx, val in enumerate(crow):
+                if val == "" and profiles[idx].get("is_numeric"):
+                    crow[idx] = self._fill_value(f_clean_hdr[idx], profiles[idx], prefs)
+                    profiles[idx]["filled_count"] = int(profiles[idx]["filled_count"]) + 1
+                    filled_mask[idx] = True
+
+            # arithmetic transforms (e.g. "make all age +1")
+            if prefs.arithmetic_columns:
+                crow = self._apply_arithmetic(crow, f_clean_hdr, prefs.arithmetic_columns, skip_indices={i for i, filled in enumerate(filled_mask) if filled})
+
+            # explicit value replacements (e.g. "make blood group o+ into A+")
+            if prefs.value_replacements:
+                crow = self._apply_value_replacements(crow, f_clean_hdr, prefs.value_replacements)
+
+            # outlier removal
+            if prefs.remove_outlier_rows:
+                out_cols = self._outlier_columns(crow, profiles)
+                if out_cols:
+                    n_out += 1
+                    continue
+
+            key = tuple(crow)
+            if prefs.remove_duplicate_rows and key in seen:
+                n_dup += 1
+                continue
+            seen.add(key)
+            cleaned_rows.append(crow)
+
+        for p in profiles:
+            if p["filled_count"] > 0:
+                imputation_summary.append({
+                    "column":       p["column_name"],
+                    "strategy":     p["strategy"],
+                    "fill_value":   p["fill_value"],
+                    "filled_count": p["filled_count"],
+                })
+
+        notes  = self._build_notes(n_empty, n_dup, n_out, profiles, prompt, prefs, dropped_labels)
+        ai_sum = self._build_ai_summary(n_empty, n_dup, n_out, dropped_labels)
+
+        out = io.StringIO()
+        csv.writer(out).writerows([f_clean_hdr] + cleaned_rows)
+
+        return CleaningSummary(
+            filename             = file_storage.filename,
+            raw_headers          = f_raw_hdr,
+            cleaned_headers      = f_clean_hdr,
+            raw_column_count     = len(rows[0]),
+            cleaned_column_count = len(f_clean_hdr),
+            raw_row_count        = len(data_rows),
+            cleaned_row_count    = len(cleaned_rows),
+            removed_empty_rows   = n_empty,
+            removed_duplicate_rows = n_dup,
+            removed_outlier_rows = n_out,
+            imputation_summary   = imputation_summary,
+            summary_notes        = notes,
+            ai_summary           = ai_sum,
+            prompt_used          = prompt or None,
+            cleaned_rows         = cleaned_rows,
+            preview_rows         = cleaned_rows[:20],
+            cleaned_csv_text     = out.getvalue(),
+        )
+
+    # ── Prompt interpretation via OpenRouter ──────────────────────────────────
+
+    def _interpret_prompt(
+        self,
+        prompt: str,
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+    ) -> PromptPreferences | None:
+        """
+        TWO-PHASE interpretation:
+
+        Phase 1 (always runs, zero API cost):
+            Scan the prompt for any actual column names mentioned. If a column
+            name from the CSV appears in the prompt alongside a drop/keep/fill
+            keyword, record it directly. This catches cases like "remove the
+            returned column" where the LLM might confuse "returned" as a verb.
+
+        Phase 2 (OpenRouter, one call):
+            Send the prompt + column list to OpenRouter for everything else
+            (arithmetic, complex fills, etc.). Phase-1 results are used as a
+            hard override on top of whatever OpenRouter returns.
+
+        Also: if the prompt is ONLY about column drop/keep and contains no
+        mention of outlier/duplicate/empty-row removal, those flags default
+        to False so we don't silently delete hundreds of rows.
+        """
+
+        # ── Phase 1: direct column-name matching ──────────────────────────────
+        direct_drop = self._direct_column_match(prompt, raw_headers, cleaned_headers, intent="drop")
+        direct_keep = self._direct_column_match(prompt, raw_headers, cleaned_headers, intent="keep")
+
+        # Detect whether the prompt is a column-level or arithmetic operation
+        # (NOT a row-removal request). We suppress outlier/duplicate/empty-row
+        # removal for these so we don't silently delete hundreds of rows.
+        explicit_row_removal = re.search(
+            r"\b(outlier|duplicate|remove\s+rows?|delete\s+rows?|drop\s+rows?|clean\s+rows?)\b",
+            prompt.lower(),
+        )
+        has_arithmetic_intent = re.search(
+            r"\b(increase|increment|add|decrease|decrement|subtract|multiply|divide"
+            r"|increases?|all\s+the\s+\w+\s+(by|\+))\b"
+            r"|\b\w+\s+(by\s+)?\+\d"
+            r"|\bincrease[sd]?\s+by\b",
+            prompt.lower(),
+        )
+        has_fill_intent = re.search(
+            r"\b(fill|replace|set)\s+.*(null|missing|empty|blank|nan)\b"
+            r"|\b(null|missing|empty|blank|nan).*\b(fill|replace|with|to)\b",
+            prompt.lower(),
+        )
+        has_value_replacement_intent = re.search(
+            r"\b(make|change|turn|convert|replace|set)\b.*\b(into|to|with|as)\b",
+            prompt.lower(),
+        )
+        has_swap_intent = re.search(
+            r"\b(swap|interchange|exchange|switch|transpose)\b",
+            prompt.lower(),
+        )
+        # Suppress row removal when: user is dropping/keeping a column, doing
+        # arithmetic, replacing null values, or rewriting values — and has NOT
+        # asked for row removal
+        column_only_prompt = (
+            bool(direct_drop or direct_keep or has_arithmetic_intent or has_fill_intent or has_value_replacement_intent or has_swap_intent)
+            and not explicit_row_removal
+        )
+
+        # ── Phase 2: OpenRouter for the rest ──────────────────────────────────
+        schema_hint = json.dumps({
+            "remove_empty_rows":    True,
+            "remove_duplicate_rows": True,
+            "remove_outlier_rows":  False,   # default False — only True if explicitly asked
+            "fill_strategy":        "null | zero | mode | median | literal | auto",
+            "fill_value":           "string or null",
+            "drop_columns":         ["exact column names to drop"],
+            "keep_columns":         ["exact column names to keep"],
+            "column_fill_values":   {"column_name": "fill_value"},
+            "arithmetic_columns":   [{"column": "col_name", "operation": "+|-|*|/", "value": 1}],
+            "swap_columns":         [{"left": "col_a", "right": "col_b"}],
+            "prompt_summary":       "one-line description of what was requested",
+        }, indent=2)
+
+        # Build a concrete few-shot example using the actual column names
+        col_example = cleaned_headers[0] if cleaned_headers else "age"
+        system_block = (
+            "You are a CSV data-cleaning configuration assistant.\n"
+            "Your ONLY job: read the user instruction and the available column names, "
+            "then output a single strict JSON object matching the schema below.\n\n"
+            "CRITICAL RULES:\n"
+            "- Output JSON ONLY. No markdown. No explanation. No extra keys.\n"
+            "- Use EXACT column names from 'Available columns (cleaned)' list.\n"
+            "- A word in the instruction that matches a column name IS a column name,\n"
+            "  even if it looks like a verb (e.g. 'returned' = column, not a verb).\n"
+            "- For arithmetic ('increase age by 1', 'all the age increases by +1',\n"
+            "  'make salary *2', 'age +1'): populate arithmetic_columns.\n"
+            "- For value rewrites ('make all blood group o+ into A+', 'change o+ to A+\n"
+            "  in blood group'): populate value_replacements.\n"
+            "- For swapping two columns ('swap columns A and B', 'interchange X with Y'):\n"
+            "  populate swap_columns with the two exact column names.\n"
+            "- For drop/keep column instructions: populate drop_columns or keep_columns.\n"
+            "- For null/missing fill ('fill null age with 0', 'replace missing salary\n"
+            "  with median', 'set empty name to Unknown'): set fill_strategy and/or\n"
+            "  column_fill_values with the specific column and value.\n"
+            "- Set remove_outlier_rows=true ONLY if user EXPLICITLY asks to remove outliers.\n"
+            "- Set remove_duplicate_rows=true ONLY if user EXPLICITLY asks to remove duplicates.\n"
+            "- Set remove_empty_rows=true ONLY if user EXPLICITLY asks to remove empty rows.\n"
+            "- Default all three removal flags to FALSE unless explicitly requested.\n\n"
+            "Examples:\n"
+            "  'all the age increases by +1' → "
+            '{"remove_outlier_rows":false,"remove_duplicate_rows":false,"remove_empty_rows":false,'
+            '"arithmetic_columns":[{"column":"age","operation":"+","value":1}],'
+            '"prompt_summary":"increase age by 1"}\n'
+            "  'i dont need the returned column' → "
+            '{"remove_outlier_rows":false,"drop_columns":["returned"],'
+            '"prompt_summary":"drop returned column"}\n'
+            "  'fill null age with 0' → "
+            '{"remove_outlier_rows":false,"fill_strategy":"literal","fill_value":"0",'
+            '"column_fill_values":{"age":"0"},"prompt_summary":"fill null age with 0"}\n'
+            "  'replace missing salary with median' → "
+            '{"remove_outlier_rows":false,"fill_strategy":"median",'
+            '"column_fill_values":{"salary":"median"},"prompt_summary":"fill salary with median"}\n\n'
+            "  'make all blood group that are o+ into A+' → "
+            '{"remove_outlier_rows":false,"value_replacements":[{"column":"blood_group","from":"o+","to":"A+"}],'
+            '"prompt_summary":"change o+ blood group values to A+"}\n\n'
+            "  'swap columns first_name and last_name' → "
+            '{"remove_outlier_rows":false,"swap_columns":[{"left":"first_name","right":"last_name"}],'
+            '"prompt_summary":"swap first_name and last_name"}\n\n'
+            f"JSON schema:\n{schema_hint}"
+        )
+
+        user_block = (
+            f"Available columns (raw):     {json.dumps(raw_headers)}\n"
+            f"Available columns (cleaned): {json.dumps(cleaned_headers)}\n\n"
+            f"User instruction: {prompt}"
+        )
+
+        full_prompt = f"{system_block}\n\n{user_block}"
+
+        print(f"[_interpret_prompt] Calling OpenRouter for prompt: {prompt[:160]}")
+        raw    = _openrouter.call(full_prompt, max_tokens=400, temperature=0.0)
+        parsed = _parse_json(raw)
+
+        if parsed:
+            print(f"[_interpret_prompt] OpenRouter JSON: {parsed}")
+            prefs = self._json_to_prefs(parsed)
+        else:
+            print("[_interpret_prompt] OpenRouter returned no usable JSON; using fallback.")
+            prefs = self._fallback_prefs(prompt, raw_headers, cleaned_headers) or PromptPreferences()
+
+        local_prefs = self._fallback_prefs(prompt, raw_headers, cleaned_headers)
+        if local_prefs:
+            prefs = self._merge_prefs(prefs, local_prefs)
+
+        # ── Phase 1 hard-override: direct column matches win ──────────────────
+        if direct_drop:
+            print(f"[_interpret_prompt] Phase-1 direct drop override: {direct_drop}")
+            prefs.drop_columns = list(dict.fromkeys((prefs.drop_columns or []) + direct_drop))
+        if direct_keep:
+            print(f"[_interpret_prompt] Phase-1 direct keep override: {direct_keep}")
+            prefs.keep_columns = list(dict.fromkeys((prefs.keep_columns or []) + direct_keep))
+
+        # ── Safety: don't silently remove rows when the prompt is column-only ─
+        if column_only_prompt:
+            prefs.remove_outlier_rows    = False
+            prefs.remove_duplicate_rows  = False
+            prefs.remove_empty_rows      = False
+            print("[_interpret_prompt] Column-only prompt detected — row-removal flags set to False.")
+
+        return prefs
+
+    def _direct_column_match(
+        self,
+        prompt: str,
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+        intent: str,  # "drop" or "keep"
+    ) -> list[str]:
+        """
+        Scan the prompt for any actual column name that appears alongside a
+        drop/keep keyword. Returns matched cleaned header names.
+
+        This is purely string-based — no LLM needed — and is the safest way
+        to catch things like "remove the returned column" where 'returned'
+        is both a verb and a column name.
+        """
+        pt = prompt.lower()
+
+        if intent == "drop":
+            has_intent = re.search(
+                r"\b(remove|drop|delete|exclude|dont need|do not need|without|get rid of|eliminate)\b",
+                pt,
+            )
+        else:
+            has_intent = re.search(
+                r"\b(keep|retain|preserve|only want|need only)\b",
+                pt,
+            )
+
+        if not has_intent:
+            return []
+
+        matched: list[str] = []
+        norm = lambda s: re.sub(r"[^a-z0-9]", " ", s.lower()).strip()
+        pt_norm = norm(pt)
+
+        for raw_h, clean_h in zip(raw_headers, cleaned_headers):
+            for h in (raw_h, clean_h):
+                h_norm = norm(h)
+                if h_norm and h_norm in pt_norm:
+                    if clean_h not in matched:
+                        matched.append(clean_h)
+                    break
+
+        return matched
+
+    def _json_to_prefs(self, data: dict) -> PromptPreferences:
+        p = PromptPreferences()
+        # Default ALL removal flags to False when coming from OpenRouter JSON.
+        # The user must explicitly request row removal — we never silently
+        # delete hundreds of rows just because the prompt didn't mention it.
+        p.remove_empty_rows      = bool(data.get("remove_empty_rows",      False))
+        p.remove_duplicate_rows  = bool(data.get("remove_duplicate_rows",  False))
+        p.remove_outlier_rows    = bool(data.get("remove_outlier_rows",    False))
+
+        fs = data.get("fill_strategy")
+        if fs in {"zero", "mode", "median", "literal", "auto"}:
+            p.fill_strategy = fs
+
+        fv = data.get("fill_value")
+        if isinstance(fv, str) and fv.strip():
+            p.fill_value = fv.strip()
+
+        dc = data.get("drop_columns")
+        if isinstance(dc, list):
+            p.drop_columns = [str(x).strip() for x in dc if str(x).strip()]
+
+        kc = data.get("keep_columns")
+        if isinstance(kc, list):
+            p.keep_columns = [str(x).strip() for x in kc if str(x).strip()]
+
+        cfv = data.get("column_fill_values")
+        if isinstance(cfv, dict):
+            p.column_fill_values = {
+                str(k).strip(): str(v).strip()
+                for k, v in cfv.items() if str(k).strip() and str(v).strip()
+            }
+
+        ac = data.get("arithmetic_columns")
+        if isinstance(ac, list):
+            valid = []
+            for item in ac:
+                if isinstance(item, dict) and item.get("column") and item.get("operation"):
+                    try:
+                        valid.append({
+                            "column":    str(item["column"]).strip(),
+                            "operation": str(item["operation"]).strip(),
+                            "value":     float(item.get("value", 0)),
+                        })
+                    except (ValueError, TypeError):
+                        pass
+            p.arithmetic_columns = valid or None
+
+        vr = data.get("value_replacements")
+        if isinstance(vr, list):
+            valid_replacements = []
+            for item in vr:
+                if isinstance(item, dict) and item.get("column") and item.get("from") is not None and item.get("to") is not None:
+                    valid_replacements.append({
+                        "column": str(item["column"]).strip(),
+                        "from": str(item["from"]).strip(),
+                        "to": str(item["to"]).strip(),
+                    })
+            p.value_replacements = valid_replacements or None
+
+        sc = data.get("swap_columns")
+        if isinstance(sc, list):
+            valid_swaps = []
+            for item in sc:
+                if isinstance(item, dict) and item.get("left") and item.get("right"):
+                    left = str(item["left"]).strip()
+                    right = str(item["right"]).strip()
+                    if left and right and left.lower() != right.lower():
+                        valid_swaps.append({"left": left, "right": right})
+            p.swap_columns = valid_swaps or None
+
+        ps = data.get("prompt_summary")
+        if isinstance(ps, str) and ps.strip():
+            p.prompt_summary = ps.strip()
+
+        return p
+
+    def _merge_prefs(self, primary: PromptPreferences, secondary: PromptPreferences) -> PromptPreferences:
+        merged = PromptPreferences(
+            remove_empty_rows=primary.remove_empty_rows,
+            remove_duplicate_rows=primary.remove_duplicate_rows,
+            remove_outlier_rows=primary.remove_outlier_rows,
+            fill_strategy=primary.fill_strategy,
+            fill_value=primary.fill_value,
+            column_fill_values=dict(primary.column_fill_values or {}),
+            treat_missing_as_blank=primary.treat_missing_as_blank,
+            drop_columns=list(primary.drop_columns or []),
+            keep_columns=list(primary.keep_columns or []),
+            arithmetic_columns=list(primary.arithmetic_columns or []),
+            value_replacements=list(primary.value_replacements or []),
+            swap_columns=list(primary.swap_columns or []),
+            prompt_summary=primary.prompt_summary,
+        )
+
+        if secondary.remove_empty_rows is not None:
+            merged.remove_empty_rows = secondary.remove_empty_rows
+        if secondary.remove_duplicate_rows is not None:
+            merged.remove_duplicate_rows = secondary.remove_duplicate_rows
+        if secondary.remove_outlier_rows is not None:
+            merged.remove_outlier_rows = secondary.remove_outlier_rows
+
+        if secondary.fill_strategy:
+            merged.fill_strategy = secondary.fill_strategy
+        if secondary.fill_value is not None:
+            merged.fill_value = secondary.fill_value
+        if secondary.column_fill_values:
+            merged.column_fill_values.update(secondary.column_fill_values)
+
+        if secondary.drop_columns:
+            merged.drop_columns = list(dict.fromkeys(merged.drop_columns + list(secondary.drop_columns)))
+        if secondary.keep_columns:
+            merged.keep_columns = list(dict.fromkeys(merged.keep_columns + list(secondary.keep_columns)))
+        if secondary.arithmetic_columns:
+            merged.arithmetic_columns = (merged.arithmetic_columns or []) + list(secondary.arithmetic_columns)
+        if secondary.value_replacements:
+            merged.value_replacements = (merged.value_replacements or []) + list(secondary.value_replacements)
+        if secondary.swap_columns:
+            merged.swap_columns = (merged.swap_columns or []) + list(secondary.swap_columns)
+
+        if merged.swap_columns:
+            deduped_swaps = []
+            seen_swaps: set[tuple[str, str]] = set()
+            for item in merged.swap_columns:
+                left = str(item.get("left", "")).strip()
+                right = str(item.get("right", "")).strip()
+                if not left or not right:
+                    continue
+                key = (left.lower(), right.lower())
+                rev = (right.lower(), left.lower())
+                if key in seen_swaps or rev in seen_swaps:
+                    continue
+                seen_swaps.add(key)
+                deduped_swaps.append({"left": left, "right": right})
+            merged.swap_columns = deduped_swaps or None
+
+        if secondary.prompt_summary:
+            merged.prompt_summary = secondary.prompt_summary
+
+        return merged
+
+    # ── Fallback: pure-regex preferences when OpenRouter unavailable ─────────
+
+    def _fallback_prefs(
+        self,
+        prompt: str,
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+    ) -> PromptPreferences | None:
+        """
+        Regex-based fallback covering:
+          - drop / keep columns
+          - arithmetic on any column  ("age +1", "increase age by 1",
+            "all the age increases by +1", "make salary *2", etc.)
+          - null/missing value replacement  ("replace null age with 0",
+            "fill missing salary with median", "set empty name to Unknown")
+        """
+        # Preserve +/- signs but strip other punctuation for easier matching
+        pt  = re.sub(r"[^a-z0-9+\-*/. ]+", " ", prompt.lower()).strip()
+        raw = prompt   # keep original case for replacement values
+
+        p       = PromptPreferences()
+        changed = False
+
+        # ── Drop columns ──────────────────────────────────────────────────────
+        drop_m = re.search(
+            r"\b(remove|drop|delete|exclude|dont need|do not need|get rid of)\s+"
+            r"(?:the\s+)?([a-z0-9_ ]+?)(?:\s+column[s]?)?(?:\s|$|,|\.)",
+            pt,
+        )
+        if drop_m:
+            term = drop_m.group(2).strip()
+            _, hdr = self._resolve_columns(raw_headers, cleaned_headers, [term])
+            if hdr:
+                p.drop_columns = hdr
+                changed = True
+
+        # ── Arithmetic on a column ────────────────────────────────────────────
+        # Patterns supported (all case-insensitive, number can be decimal):
+        #   "age + 1"  /  "age +1"  /  "age by +1"
+        #   "increase age by 1"  /  "add 1 to age"  /  "age increases by 1"
+        #   "all the age increases by +1"  /  "make all age +1"
+        #   "decrease salary by 10"  /  "multiply price by 2"  /  "divide price by 100"
+        arith_patterns = [
+            # "increase/add/increment <col> by <n>"
+            (r"\b(?:increase[sd]?|add|increment)\s+(?:all\s+(?:the\s+)?)?"
+             r"([a-z_][a-z0-9_]*)\s+(?:by\s+)?\+?\s*(\d+(?:\.\d+)?)\b",   "+"),
+            # "all the <col> increase[s] by [+]<n>"
+            (r"\ball\s+the\s+([a-z_][a-z0-9_]*)\s+increases?\s+by\s+\+?\s*(\d+(?:\.\d+)?)\b", "+"),
+            # "<col> increases by [+]<n>"
+            (r"\b([a-z_][a-z0-9_]*)\s+increases?\s+by\s+\+?\s*(\d+(?:\.\d+)?)\b", "+"),
+            # "decrease/subtract/decrement <col> by <n>"
+            (r"\b(?:decrease[sd]?|subtract|decrement)\s+(?:all\s+(?:the\s+)?)?"
+             r"([a-z_][a-z0-9_]*)\s+(?:by\s+)?\+?\s*(\d+(?:\.\d+)?)\b",   "-"),
+            # "multiply <col> by <n>"
+            (r"\bmultiply\s+(?:all\s+(?:the\s+)?)?"
+             r"([a-z_][a-z0-9_]*)\s+(?:by\s+)?(\d+(?:\.\d+)?)\b",          "*"),
+            # "divide <col> by <n>"
+            (r"\bdivide\s+(?:all\s+(?:the\s+)?)?"
+             r"([a-z_][a-z0-9_]*)\s+(?:by\s+)?(\d+(?:\.\d+)?)\b",          "/"),
+            # "add <n> to <col>"
+            (r"\badd\s+(\d+(?:\.\d+)?)\s+to\s+([a-z_][a-z0-9_]*)\b",       "+", True),
+            # "make [all] <col> [+/-/*//] <n>"
+            (r"\bmake\s+(?:all\s+)?([a-z_][a-z0-9_]*)\s*([+\-*/])\s*(\d+(?:\.\d+)?)\b", None),
+            # bare "<col> [+/-/*//] <n>"  (e.g. "age +1")
+            (r"\b([a-z_][a-z0-9_]*)\s*([+\-*/])\s*(\d+(?:\.\d+)?)\b",       None),
+        ]
+
+        arith_found = False
+        for entry in arith_patterns:
+            pattern, fixed_op = entry[0], entry[1]
+            swap = len(entry) > 2 and entry[2]  # "add N to col" — groups reversed
+            m = re.search(pattern, pt)
+            if not m:
+                continue
+            g = m.groups()
+            if fixed_op is None:
+                # groups: col, op, val  OR  col, op, val
+                col, op, val = g[0], g[1], g[2]
+            elif swap:
+                # groups: val, col
+                val, col, op = g[0], g[1], fixed_op
+            else:
+                col, val, op = g[0], g[1], fixed_op
+
+            # skip if col token is a stop-word or looks like a number
+            if col in {"all", "the", "a", "by", "to", "in", "of", "for"}:
+                continue
+            if re.fullmatch(r"\d+(?:\.\d+)?", col):
+                continue
+
+            _, matched = self._resolve_columns(raw_headers, cleaned_headers, [col])
+            target_col = matched[0] if matched else col
             try:
-                numeric_values.append(float(value))
+                p.arithmetic_columns = [{"column": target_col, "operation": op, "value": float(val)}]
+                changed      = True
+                arith_found  = True
+                print(f"[_fallback_prefs] Arithmetic: {target_col} {op} {val}")
+            except (ValueError, TypeError):
+                pass
+            if arith_found:
+                break
+
+        # ── Value replacements on a column ───────────────────────────────────
+        replace_patterns = [
+            # "make all blood group that are o+ into a+"
+            r"\b(?:make|change|turn|convert|replace|set)\s+(?:all\s+)?(?:the\s+)?([a-z_][a-z0-9_ ]*?)\s+(?:that\s+are|that\s+is|which\s+are|which\s+is|where\s+they\s+are)?\s*([^\s,;]+)\s+(?:into|to|with|as)\s+([^\s,;]+)",
+            # "make all o+ blood group into a+"
+            r"\b(?:make|change|turn|convert|replace|set)\s+(?:all\s+)?([^\s,;]+)\s+([a-z_][a-z0-9_ ]*?)\s+(?:into|to|with|as)\s+([^\s,;]+)",
+            # "change o+ to a+ in blood group"
+            r"\b(?:change|replace|turn|convert|set)\s+([^\s,;]+)\s+(?:into|to|with|as)\s+([^\s,;]+)\s+(?:in|for)\s+([a-z_][a-z0-9_ ]*?)\b",
+        ]
+
+        seen_replacements: set[tuple[str, str, str]] = set()
+        for pat in replace_patterns:
+            for m in re.finditer(pat, raw, flags=re.IGNORECASE):
+                groups = [g.strip() for g in m.groups() if g and g.strip()]
+                if len(groups) != 3:
+                    continue
+                first, second, third = groups
+                first_cols, _ = self._resolve_columns(raw_headers, cleaned_headers, first.split())
+                second_cols, _ = self._resolve_columns(raw_headers, cleaned_headers, second.split())
+
+                if first_cols and not second_cols:
+                    col_phrase, old_value, new_value = first, second, third
+                elif second_cols and not first_cols:
+                    col_phrase, old_value, new_value = second, first, third
+                else:
+                    col_phrase, old_value, new_value = first, second, third
+
+                # If this looks like a null-fill instruction, let the fill
+                # parser handle it instead of treating it as a value rewrite.
+                if ("null" in old_value.lower() and "values" in old_value.lower()) or (
+                    old_value.lower() in {"null", "missing", "empty", "blank", "nan"}
+                ):
+                    continue
+
+                _, matched_cols = self._resolve_columns(raw_headers, cleaned_headers, col_phrase.split())
+                if not matched_cols:
+                    matched_cols = [col_phrase]
+                p.value_replacements = p.value_replacements or []
+                for mc in matched_cols:
+                    key = (mc.lower(), old_value.lower(), new_value.lower())
+                    if key in seen_replacements:
+                        continue
+                    seen_replacements.add(key)
+                    p.value_replacements.append({"column": mc, "from": old_value, "to": new_value})
+                    changed = True
+
+        # ── Column swaps ─────────────────────────────────────────────────────
+        swap_patterns = [
+            r"\b(?:swap|interchange|exchange|switch|transpose)\s+(?:the\s+)?(?:values\s+in\s+)?(?:columns?\s+)?([a-z_][a-z0-9_ ]*?)\s+(?:with|and|to)\s+([a-z_][a-z0-9_ ]*?)\b",
+            r"\b(?:swap|interchange|exchange|switch|transpose)\s+(?:the\s+)?([a-z_][a-z0-9_ ]*?)\s+(?:with|and|to)\s+([a-z_][a-z0-9_ ]*?)\s+columns?\b",
+        ]
+        seen_swaps: set[tuple[str, str]] = set()
+        for pat in swap_patterns:
+            for m in re.finditer(pat, raw, flags=re.IGNORECASE):
+                left_phrase = m.group(1).strip()
+                right_phrase = m.group(2).strip()
+                _, left_cols = self._resolve_columns(raw_headers, cleaned_headers, left_phrase.split())
+                _, right_cols = self._resolve_columns(raw_headers, cleaned_headers, right_phrase.split())
+                if not left_cols or not right_cols:
+                    continue
+                for left_col in left_cols:
+                    for right_col in right_cols:
+                        if left_col.lower() == right_col.lower():
+                            continue
+                        key = (left_col.lower(), right_col.lower())
+                        rev = (right_col.lower(), left_col.lower())
+                        if key in seen_swaps or rev in seen_swaps:
+                            continue
+                        seen_swaps.add(key)
+                        p.swap_columns = p.swap_columns or []
+                        p.swap_columns.append({"left": left_col, "right": right_col})
+                        changed = True
+
+        # ── Null / missing value fill ─────────────────────────────────────────
+        # Patterns:
+        #   "fill missing age with 0"   /  "replace null age with Unknown"
+        #   "fill null values in salary with median"
+        #   "set empty name to John"    /  "fill age nulls with -1"
+        #   "replace all nulls with 0"  /  "fill missing values with mode"
+        null_patterns = [
+            # "fill/replace [missing/null/empty] <col> [values] with/to <value>"
+            r"\b(?:fill|replace|set)\s+(?:missing|null|empty|nan|blank)?\s*"
+            r"([a-z_][a-z0-9_ ]*?)\s+(?:values?\s+)?(?:with|to|by|=)\s+"
+            r"([a-z0-9_.\-]+)\b",
+            # "fill null values in <col> with <value>"
+            r"\b(?:fill|replace)\s+(?:null|missing|empty|nan|blank)\s+values?\s+in\s+"
+            r"([a-z_][a-z0-9_ ]*?)\s+(?:with|to)\s+([a-z0-9_.\-]+)\b",
+            # "fill missing values with <strategy/value>"  (no column = global)
+            r"\b(?:fill|replace)\s+(?:all\s+)?(?:missing|null|empty|nan|blank)\s+values?\s+"
+            r"(?:with|to)\s+([a-z0-9_.\-]+)\b",
+            # "<col> nulls / missing with <value>"
+            r"\b([a-z_][a-z0-9_]*)\s+(?:nulls?|missing|empty|blanks?)\s+"
+            r"(?:with|to|=)\s+([a-z0-9_.\-]+)\b",
+        ]
+
+        strategy_words = {"median", "mean", "mode", "average", "zero", "auto"}
+        # Note: "0" as a fill value stays literal (column_fill_values) not strategy "zero"
+
+        for pat in null_patterns:
+            for m in re.finditer(pat, pt):
+                g = m.groups()
+                if len(g) == 1:
+                    # Global fill — no specific column
+                    fill_word = g[0].strip()
+                    if fill_word in strategy_words:
+                        strat = "median" if fill_word in {"mean", "average"} else fill_word
+                        if strat == "0": strat = "zero"
+                        p.fill_strategy = strat
+                    else:
+                        p.fill_strategy = "literal"
+                        p.fill_value    = fill_word
+                    changed = True
+                else:
+                    col_phrase, fill_word = g[0].strip(), g[1].strip()
+                    # Guard against the broad pattern swallowing phrases like
+                    # 'replace null values in region with mumbai' as
+                    # 'values in region'. The more specific 'in <column>'
+                    # pattern should handle those.
+                    if col_phrase.startswith("values ") or col_phrase == "values":
+                        continue
+                    # Try to match col_phrase to an actual column
+                    _, matched_cols = self._resolve_columns(raw_headers, cleaned_headers,
+                                                            col_phrase.split())
+                    if not matched_cols:
+                        matched_cols = [col_phrase]
+                    for mc in matched_cols:
+                        if fill_word in strategy_words:
+                            strat = "median" if fill_word in {"mean","average"} else fill_word
+                            if strat == "0": strat = "zero"
+                            p.fill_strategy = strat
+                        else:
+                            p.fill_strategy = "literal"
+                            p.fill_value    = fill_word
+                            p.column_fill_values = {
+                                **(p.column_fill_values or {}),
+                                mc: fill_word,
+                            }
+                        changed = True
+
+        # ── Simple strategy keywords ──────────────────────────────────────────
+        if not p.fill_strategy:
+            if re.search(r"\bfill\b.*\bmedian\b|\bmedian\b.*\b(fill|missing)\b", pt):
+                p.fill_strategy = "median"; changed = True
+            elif re.search(r"\bfill\b.*\bmode\b|\bmode\b.*\b(fill|missing)\b", pt):
+                p.fill_strategy = "mode"; changed = True
+            elif re.search(r"\bfill\b.*\bzero\b|replace.*missing.*\b0\b", pt):
+                p.fill_strategy = "zero"; changed = True
+
+        return p if changed else None
+
+    # ── Arithmetic transforms ─────────────────────────────────────────────────
+
+    def _apply_arithmetic(
+        self,
+        row: list[str],
+        headers: list[str],
+        arithmetic_columns: list[dict],
+        skip_indices: set[int] | None = None,
+    ) -> list[str]:
+        row = list(row)
+        skip_indices = skip_indices or set()
+        ops = {
+            "+": lambda a, b: a + b,
+            "-": lambda a, b: a - b,
+            "*": lambda a, b: a * b,
+            "/": lambda a, b: a / b if b else a,
+        }
+        for spec in arithmetic_columns:
+            col = spec["column"]
+            op  = spec["operation"]
+            val = float(spec["value"])
+            # Match by exact name OR fuzzy (cleaned column name)
+            target_idx = None
+            if col in headers:
+                target_idx = headers.index(col)
+            else:
+                norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+                for i, h in enumerate(headers):
+                    if norm(h) == norm(col) or norm(col) in norm(h):
+                        target_idx = i
+                        break
+            if target_idx is None:
+                print(f"[_apply_arithmetic] Column '{col}' not found in headers {headers}")
+                continue
+            if target_idx in skip_indices:
+                continue
+            try:
+                current = row[target_idx]
+                if current == "":
+                    continue  # skip blank cells
+                new_val  = ops[op](float(current), val)
+                row[target_idx] = self._format_number(new_val)
+            except (ValueError, KeyError, ZeroDivisionError) as e:
+                print(f"[_apply_arithmetic] Skipped row[{target_idx}]='{row[target_idx]}': {e}")
+        return row
+
+    def _apply_value_replacements(
+        self,
+        row: list[str],
+        headers: list[str],
+        replacements: list[dict],
+    ) -> list[str]:
+        row = list(row)
+
+        def norm_value(value: str) -> str:
+            return re.sub(r"\s+", "", str(value).strip().lower())
+
+        for spec in replacements:
+            col = str(spec.get("column", "")).strip()
+            old_value = str(spec.get("from", "")).strip()
+            new_value = str(spec.get("to", "")).strip()
+            if not col or not old_value:
+                continue
+
+            target_idx = None
+            if col in headers:
+                target_idx = headers.index(col)
+            else:
+                norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+                for i, h in enumerate(headers):
+                    if norm(h) == norm(col) or norm(col) in norm(h):
+                        target_idx = i
+                        break
+            if target_idx is None:
+                continue
+
+            current = row[target_idx]
+            if norm_value(current) == norm_value(old_value):
+                row[target_idx] = new_value
+
+        return row
+
+    def _apply_column_swaps(
+        self,
+        row: list[str],
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+        swaps: list[dict],
+    ) -> list[str]:
+        row = list(row)
+
+        def resolve(col_name: str) -> int | None:
+            if col_name in cleaned_headers:
+                return cleaned_headers.index(col_name)
+            if col_name in raw_headers:
+                return raw_headers.index(col_name)
+            norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+            for i, h in enumerate(cleaned_headers):
+                if norm(h) == norm(col_name) or norm(col_name) in norm(h):
+                    return i
+            for i, h in enumerate(raw_headers):
+                if norm(h) == norm(col_name) or norm(col_name) in norm(h):
+                    return i
+            return None
+
+        for spec in swaps:
+            left = str(spec.get("left", "")).strip()
+            right = str(spec.get("right", "")).strip()
+            if not left or not right:
+                continue
+            left_idx = resolve(left)
+            right_idx = resolve(right)
+            if left_idx is None or right_idx is None or left_idx == right_idx:
+                continue
+            row[left_idx], row[right_idx] = row[right_idx], row[left_idx]
+
+        return row
+
+    def _apply_column_swaps_to_order(
+        self,
+        kept_idx: list[int],
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+        swaps: list[dict],
+    ) -> tuple[list[int], list[str], list[str]]:
+        order = list(range(len(kept_idx)))
+
+        def resolve(col_name: str) -> int | None:
+            if col_name in cleaned_headers:
+                return cleaned_headers.index(col_name)
+            if col_name in raw_headers:
+                return raw_headers.index(col_name)
+            norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+            for i, h in enumerate(cleaned_headers):
+                if norm(h) == norm(col_name) or norm(col_name) in norm(h):
+                    return i
+            for i, h in enumerate(raw_headers):
+                if norm(h) == norm(col_name) or norm(col_name) in norm(h):
+                    return i
+            return None
+
+        for spec in swaps:
+            left = str(spec.get("left", "")).strip()
+            right = str(spec.get("right", "")).strip()
+            if not left or not right:
+                continue
+            left_idx = resolve(left)
+            right_idx = resolve(right)
+            if left_idx is None or right_idx is None or left_idx == right_idx:
+                continue
+            if left_idx not in order or right_idx not in order:
+                continue
+            left_pos = order.index(left_idx)
+            right_pos = order.index(right_idx)
+            order[left_pos], order[right_pos] = order[right_pos], order[left_pos]
+
+        return (
+            [kept_idx[i] for i in order],
+            [raw_headers[i] for i in order],
+            [cleaned_headers[i] for i in order],
+        )
+
+    def _apply_invalid_value_rules(
+        self,
+        row: list[str],
+        headers: list[str],
+        profiles: list[dict],
+        prefs: "PromptPreferences",
+    ) -> tuple[list[str], bool]:
+        """
+        Replace physically impossible values with empty string so they get
+        filled by the normal fill-value logic later.
+
+        Rules applied:
+          - Any numeric column whose name contains 'age' must be 0–120.
+          - Any numeric column whose value is below its IQR lower bound by more
+            than 3× IQR (extreme outlier) is blanked only when the prompt
+            contains a hint like "invalid", "impossible", "negative", "clean",
+            "fix", or "validate".
+          - Returns (cleaned_row, was_modified).
+        """
+        row      = list(row)
+        modified = False
+        prompt_hint = bool(
+            prefs.prompt_summary and re.search(
+                r"\b(invalid|impossible|negative|fix|clean|validate|correct)\b",
+                prefs.prompt_summary.lower(),
+            )
+        )
+
+        for i, (val, profile) in enumerate(zip(row, profiles)):
+            if val == "" or not profile.get("is_numeric"):
+                continue
+            try:
+                num = float(val)
             except ValueError:
-                return []
-        return numeric_values
+                continue
+
+            col_name = profile["column_name"].lower()
+
+            # Age column: must be 0–120
+            if "age" in col_name and not (0 <= num <= 120):
+                row[i]   = ""
+                modified = True
+                print(f"[_apply_invalid_value_rules] Blanked invalid age: {val}")
+                continue
+
+        return row, modified
+
+    # ── Column resolution ─────────────────────────────────────────────────────
+
+    def _resolve_columns(
+        self,
+        raw_headers: list[str],
+        cleaned_headers: list[str],
+        terms: list[str],
+    ) -> tuple[list[int], list[str]]:
+        if not terms:
+            return [], []
+        idxs: list[int] = []
+        hdrs: list[str] = []
+        norm_raw  = [re.sub(r"[^a-z0-9]", " ", h.lower()).strip() for h in raw_headers]
+        norm_cln  = [re.sub(r"[^a-z0-9]", " ", h.lower()).strip() for h in cleaned_headers]
+        for term in terms:
+            nt = re.sub(r"[^a-z0-9]", " ", term.lower()).strip()
+            if not nt:
+                continue
+            for i, (rn, cn) in enumerate(zip(norm_raw, norm_cln)):
+                if nt in (rn, cn) or nt in rn or nt in cn or rn in nt or cn in nt:
+                    if i not in idxs:
+                        idxs.append(i)
+                        hdrs.append(cleaned_headers[i])
+                    break
+        return idxs, hdrs
+
+    # ── Cell cleaning ─────────────────────────────────────────────────────────
+
+    def _clean_cell(self, value: str) -> str:
+        v = re.sub(r"\s+", " ", value.strip())
+        if v.lower() in self.EMPTY_MARKERS:
+            return ""
+        num = self._try_parse_number(v)
+        return self._format_number(num) if num is not None else v
+
+    def _try_parse_number(self, value: str) -> float | None:
+        v = value.strip().replace("−", "-")
+        m = re.fullmatch(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?", v)
+        if m:
+            try:
+                return float(v.replace(",", ""))
+            except ValueError:
+                pass
+        return None
 
     def _format_number(self, value: float) -> str:
-        if value.is_integer():
+        if value != value:   # NaN guard
+            return ""
+        if float(value).is_integer():
             return str(int(value))
-        return ("{:.6f}".format(value)).rstrip("0").rstrip(".")
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
+    # ── Fill value resolution ─────────────────────────────────────────────────
+
+    def _fill_value(self, col: str, profile: dict, prefs: PromptPreferences) -> str:
+        norm = lambda s: re.sub(r"[^a-z0-9]", " ", s.lower()).strip()
+        nc = norm(col)
+
+        # per-column override
+        for k, v in (prefs.column_fill_values or {}).items():
+            if norm(k) == nc or norm(k) in nc or nc in norm(k):
+                return v
+
+        if prefs.fill_strategy == "literal" and prefs.fill_value is not None:
+            # Keep literal fills scoped to the explicit per-column mapping when
+            # the prompt names a target column. Otherwise a prompt like
+            # 'replace null values in region with mumbai' would fill every blank
+            # cell with 'mumbai'.
+            if prefs.column_fill_values:
+                return str(profile["fill_value"])
+            return prefs.fill_value
+        if prefs.fill_strategy == "zero":
+            return "0"
+
+        strategy = prefs.fill_strategy or profile["strategy"]
+        if strategy == "median" and profile.get("is_numeric"):
+            nums = self._extract_nums(profile.get("sample_values", []))
+            if nums:
+                return self._format_number(median(nums))
+        if strategy == "mode":
+            return self._mode(list(profile.get("sample_values", []))) or "Unknown"
+        return str(profile["fill_value"])
+
+    # ── Column profiles ───────────────────────────────────────────────────────
+
+    def _build_column_profiles(
+        self,
+        headers: list[str],
+        data_rows: list[list[str]],
+        kept_idx: list[int],
+    ) -> list[dict]:
+        profiles = []
+        pad_to = (max(kept_idx) + 1) if kept_idx else 0
+        for pi, si in enumerate(kept_idx):
+            vals = []
+            for row in data_rows:
+                pr  = self._pad_row(row, pad_to)
+                cv  = self._clean_cell(pr[si])
+                if cv:
+                    vals.append(cv)
+            nums      = self._extract_nums(vals)
+            num_ratio = len(nums) / max(len(vals), 1)
+            is_num    = bool(nums) and num_ratio >= 0.6
+
+            if is_num and len(nums) >= 3:
+                fv       = self._format_number(median(nums))
+                strategy = "median"
+                lo, hi   = self._iqr_bounds(nums)
+            else:
+                fv       = self._mode(vals) or "Unknown"
+                strategy = "mode"
+                lo = hi  = None
+
+            profiles.append({
+                "column_name":  headers[pi],
+                "strategy":     strategy,
+                "fill_value":   fv,
+                "filled_count": 0,
+                "is_numeric":   is_num,
+                "outlier_min":  lo,
+                "outlier_max":  hi,
+                "outlier_count": 0,
+                "non_empty_count": len(vals),
+                "sample_values": vals[:5],
+            })
+        return profiles
+
+    def _iqr_bounds(self, nums: list[float]) -> tuple[float | None, float | None]:
+        if len(nums) < 4:
+            return None, None
+        s   = sorted(nums)
+        mid = len(s) // 2
+        q1  = median(s[:mid])
+        q3  = median(s[mid + (len(s) % 2):])
+        iqr = q3 - q1
+        if iqr <= 0:
+            return None, None
+        return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+    def _outlier_columns(self, row: list[str], profiles: list[dict]) -> list[str]:
+        out = []
+        for i, p in enumerate(profiles):
+            lo, hi = p.get("outlier_min"), p.get("outlier_max")
+            if lo is None or hi is None:
+                continue
+            try:
+                v = float(row[i])
+                if v < float(lo) or v > float(hi):
+                    out.append(str(p["column_name"]))
+            except (ValueError, TypeError, IndexError):
+                pass
+        return out
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _pad_row(self, row: list[str], n: int) -> list[str]:
+        r = list(row[:n])
+        r += [""] * max(0, n - len(r))
+        return r
+
+    def _normalize_headers(self, headers: list[str]) -> list[str]:
+        seen: dict[str, int] = {}
+        out: list[str] = []
+        for i, h in enumerate(headers, 1):
+            c = re.sub(r"[^a-z0-9]+", "_", h.strip().lower()).strip("_") or f"column_{i}"
+            n = seen.get(c, 0)
+            seen[c] = n + 1
+            out.append(c if n == 0 else f"{c}_{n + 1}")
+        return out
+
+    def _extract_nums(self, values: list[str]) -> list[float]:
+        out = []
+        for v in values:
+            n = self._try_parse_number(v)
+            if n is not None:
+                out.append(n)
+        return out
 
     def _mode(self, values: list[str]) -> str | None:
         if not values:
             return None
-
         counts: dict[str, int] = {}
-        order: list[str] = []
-        for value in values:
-            if value not in counts:
-                order.append(value)
-            counts[value] = counts.get(value, 0) + 1
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        return max(counts, key=counts.__getitem__)
 
-        best_value = order[0]
-        best_count = counts[best_value]
-        for value in order[1:]:
-            if counts[value] > best_count:
-                best_value = value
-                best_count = counts[value]
+    # ── Summary helpers ───────────────────────────────────────────────────────
 
-        return best_value
+    def _build_notes(self, n_empty, n_dup, n_out, profiles, prompt, prefs, dropped):
+        notes = []
+        if prompt:
+            notes.append(f"Prompt: {prompt[:160]}")
+        if prefs.prompt_summary:
+            notes.append(f"Interpreted as: {prefs.prompt_summary}")
+        if prefs.swap_columns:
+            swap_text = ", ".join(f"{item['left']} ↔ {item['right']}" for item in prefs.swap_columns)
+            notes.append(f"Swapped column positions: {swap_text}.")
+        if prefs.arithmetic_columns:
+            for ac in prefs.arithmetic_columns:
+                notes.append(f"Applied arithmetic: {ac['column']} {ac['operation']} {ac['value']}")
+        if dropped:
+            notes.append(f"Dropped columns: {', '.join(dropped)}")
+        if n_empty:
+            notes.append(f"Removed {n_empty} empty row{'s' if n_empty != 1 else ''}.")
+        if n_dup:
+            notes.append(f"Removed {n_dup} duplicate row{'s' if n_dup != 1 else ''}.")
+        if n_out:
+            notes.append(f"Removed {n_out} outlier row{'s' if n_out != 1 else ''}.")
+        filled = [p for p in profiles if p["filled_count"] > 0]
+        if filled:
+            cols = ", ".join(p["column_name"] for p in filled[:4])
+            notes.append(f"Filled missing values in: {cols}.")
+        if not notes:
+            notes.append("No cleaning issues found; headers normalized.")
+        return notes
+
+    def _build_ai_summary(self, n_empty, n_dup, n_out, dropped) -> str:
+        bits = []
+        if dropped:      bits.append(f"dropped columns {', '.join(dropped)}")
+        if n_out:        bits.append(f"removed {n_out} outlier row(s)")
+        if n_dup:        bits.append(f"deduplicated {n_dup} row(s)")
+        if n_empty:      bits.append(f"dropped {n_empty} empty row(s)")
+        if not bits:     bits.append("normalized headers")
+        return "Cleaned: " + ", ".join(bits) + "."

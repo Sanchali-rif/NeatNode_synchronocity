@@ -9,7 +9,7 @@ from flask_cors import CORS
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_file, url_for
 
 from cleaning_model import CSVCleaningModel
-from query_assistant import DataQueryAssistant
+from query_assistant import DataQueryAssistant, QueryResult
 
 
 def create_app() -> Flask:
@@ -146,6 +146,31 @@ def create_app() -> Flask:
             "chat_history": chat_history,
         }
 
+    def build_arithmetic_result(question: str, cleaning_result) -> QueryResult | None:
+        arithmetic_spec = assistant._parse_arithmetic_prompt(question, cleaning_result.cleaned_headers)
+        if not arithmetic_spec:
+            return None
+
+        transformed_rows = [
+            assistant._apply_arithmetic_preview(row, cleaning_result.cleaned_headers, arithmetic_spec)
+            for row in cleaning_result.preview_rows
+        ]
+        return QueryResult(
+            question=question,
+            intent="local_transform_preview",
+            title="Transformed preview",
+            summary=f"Applied {arithmetic_spec['column']} {arithmetic_spec['operation']} {arithmetic_spec['value']} to the preview rows.",
+            sql_like="SELECT * FROM cleaned_data LIMIT 20",
+            matched_row_count=len(transformed_rows),
+            total_row_count=cleaning_result.cleaned_row_count,
+            table_headers=cleaning_result.cleaned_headers,
+            table_rows=transformed_rows,
+            detail_lines=[
+                "Answered locally — no SQL needed.",
+                f"Preview shows {arithmetic_spec['column']} updated in the output rows.",
+            ],
+        )
+
     def build_export_file(cleaned_csv_text: str, export_format: str) -> tuple[bytes, str, str]:
         headers, rows = parse_cleaned_csv(cleaned_csv_text)
 
@@ -216,7 +241,6 @@ def create_app() -> Flask:
     def home() -> str:
         cleaning_result = None
         download_token = None
-        cleaning_prompt = ""
 
         if request.method == "POST":
             uploaded_file = request.files.get("csv_file")
@@ -331,7 +355,31 @@ def create_app() -> Flask:
                 chat_history=dataset.get("chat_history", []),
             )
 
-        assistant_response = assistant.answer(question, cleaning_result.cleaned_headers, cleaning_result.cleaned_rows)
+        arithmetic_response = build_arithmetic_result(question, cleaning_result)
+        if arithmetic_response is not None:
+            chat_history = dataset.setdefault("chat_history", [])
+            chat_history.append({"role": "user", "content": question})
+            chat_history.append({"role": "assistant", "content": arithmetic_response.summary})
+
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.accept_mimetypes.best == "application/json":
+                return jsonify(build_assistant_payload(arithmetic_response, question, chat_history))
+
+            return render_result_page(
+                cleaning_result=cleaning_result,
+                download_token=token,
+                assistant_response=arithmetic_response,
+                assistant_question=question,
+                chat_history=chat_history,
+            )
+
+        assistant_response = assistant.answer(
+            question,
+            cleaning_result.cleaned_headers,
+            cleaning_result.cleaned_rows,
+            preview_rows=cleaning_result.preview_rows,
+            cleaning_prompt=cleaning_result.prompt_used,
+            summary_notes=cleaning_result.summary_notes,
+        )
         chat_history = dataset.setdefault("chat_history", [])
         chat_history.append({"role": "user", "content": question})
         chat_history.append({"role": "assistant", "content": assistant_response.summary})
@@ -356,7 +404,20 @@ def create_app() -> Flask:
         question = (request.form.get("data_question") or "").strip()
         if not question:
             return jsonify({"error": "empty_question"}), 400
-        assistant_response = assistant.answer(question, cleaning_result.cleaned_headers, cleaning_result.cleaned_rows)
+        arithmetic_response = build_arithmetic_result(question, cleaning_result)
+        if arithmetic_response is not None:
+            chat_history = dataset.setdefault("chat_history", [])
+            chat_history.append({"role": "user", "content": question})
+            chat_history.append({"role": "assistant", "content": arithmetic_response.summary})
+            return jsonify(build_assistant_payload(arithmetic_response, question, chat_history))
+        assistant_response = assistant.answer(
+            question,
+            cleaning_result.cleaned_headers,
+            cleaning_result.cleaned_rows,
+            preview_rows=cleaning_result.preview_rows,
+            cleaning_prompt=cleaning_result.prompt_used,
+            summary_notes=cleaning_result.summary_notes,
+        )
         chat_history = dataset.setdefault("chat_history", [])
         chat_history.append({"role": "user", "content": question})
         chat_history.append({"role": "assistant", "content": assistant_response.summary})

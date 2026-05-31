@@ -124,10 +124,10 @@
           id="cleaning_prompt"
           name="cleaning_prompt"
           rows="4"
-          placeholder="Example: clean the data, remove outliers, and keep the most useful rows for analysis."
+          placeholder="Example: clean the data, swap columns first_name and last_name, or replace o+ blood group values with A+."
         >{{ cleaning_prompt or '' }}</textarea>
       </label>
-      <p class="hint">Leave this blank to use the built-in cleaning flow. If Gemini is configured, it will also add review notes.</p>
+      <p class="hint">Leave this blank to use the built-in cleaning flow. You can also ask it to swap two columns, like “swap columns first_name and last_name”. If you add a prompt, the cleaner uses it locally first and only consults OpenRouter when it needs extra context.</p>
 
       <button type="submit" class="upload-button">Upload CSV</button>
     </form>
@@ -212,6 +212,9 @@
           {% if cleaning_result.prompt_used %}
             <p>Prompt applied: {{ cleaning_result.prompt_used }}</p>
           {% endif %}
+          {% if cleaning_result.ai_review_error %}
+            <p class="alert alert-error">{{ cleaning_result.ai_review_error }}</p>
+          {% endif %}
           </div>
         </section>
       </div>
@@ -268,7 +271,7 @@
       <section class="assistant-panel" aria-label="Data assistant">
         <div class="panel-head">
           <span class="result-label">Data assistant</span>
-          <p>Ask the cleaned CSV in plain English and the assistant will translate it into a generic query.</p>
+          <p>Ask the cleaned CSV in plain English. The assistant uses the cleaned preview, the upload prompt, and only falls back to Gemini when a local query plan is not obvious.</p>
         </div>
 
         <form class="assistant-form" data-assistant-form action="{{ url_for('ask_dataset', token=download_token) }}" method="post">

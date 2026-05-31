@@ -1,13 +1,26 @@
 from __future__ import annotations
-
-import csv
-import io
+ 
+import json
+import os
 import re
+import sqlite3
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
-from statistics import mean, median
-from typing import Any
-
-
+ 
+# ── OpenRouter config (shared with cleaning_model) ─────────────────────────
+# Keep this in sync with cleaning_model.py — or move to a shared config.py
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "gpt-oss-120b:free"
+OPENROUTER_TIMEOUT   = 15
+OPENROUTER_RETRIES   = 2
+OPENROUTER_BACKOFF   = 2
+OPENROUTER_COOLDOWN  = 12
+ 
+FALLBACK_SQL = "SELECT * FROM cleaned_data LIMIT 20"
+ 
+ 
 @dataclass
 class QueryResult:
     question: str
@@ -20,513 +33,450 @@ class QueryResult:
     table_headers: list[str]
     table_rows: list[list[str]]
     detail_lines: list[str] = field(default_factory=list)
-
-
-@dataclass
-class Condition:
-    column: str
-    operator: str
-    value: str
-    value_end: str | None = None
-
-
+ 
+ 
+# ── Tiny OpenRouter client (same pattern as cleaning_model) ───────────────
+ 
+class _OpenRouterClient:
+    def __init__(self) -> None:
+        self._cooldown_until: float = 0.0
+ 
+    def call(self, prompt: str, max_tokens: int = 300) -> str | None:
+        api_key = OPENROUTER_API_KEY
+        if not api_key:
+            print("[OpenRouter/query] API key not configured.")
+            return None
+ 
+        now = time.time()
+        if now < self._cooldown_until:
+            print(f"[OpenRouter/query] Cooldown active — {int(self._cooldown_until - now)}s remaining.")
+            return None
+ 
+        payload = json.dumps({
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON when asked for structured output."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }).encode("utf-8")
+ 
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        for attempt in range(OPENROUTER_RETRIES + 1):
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "NeatNode Synchronocity",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                text = (
+                    body.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                ).strip()
+                if text:
+                    print(f"[OpenRouter/query] OK via {OPENROUTER_MODEL}: {text[:200]}")
+                    return text
+                print("[OpenRouter/query] Empty response.")
+                return None
+            except urllib.error.HTTPError as err:
+                if err.code == 429:
+                    if attempt < OPENROUTER_RETRIES:
+                        time.sleep(OPENROUTER_BACKOFF * (attempt + 1))
+                        continue
+                    self._cooldown_until = time.time() + OPENROUTER_COOLDOWN
+                    print("[OpenRouter/query] 429 — cooldown set.")
+                    return None
+                print(f"[OpenRouter/query] HTTP {err.code}")
+                return None
+            except Exception as exc:
+                print(f"[OpenRouter/query] Error: {exc}")
+                return None
+        return None
+ 
+ 
+_openrouter = _OpenRouterClient()
+ 
+ 
+def _parse_json(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    text = re.sub(r"```(?:json)?|```", "", raw).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+    return None
+ 
+ 
+# ── Main assistant ────────────────────────────────────────────────────────
+ 
 class DataQueryAssistant:
-    STOPWORDS = {
-        "a",
-        "an",
-        "and",
-        "are",
-        "be",
-        "by",
-        "for",
-        "from",
-        "give",
-        "how",
-        "in",
-        "is",
-        "list",
-        "many",
-        "me",
-        "of",
-        "on",
-        "rows",
-        "show",
-        "the",
-        "that",
-        "this",
-        "to",
-        "top",
-        "what",
-        "where",
-        "with",
-        "which",
-    }
-
-    def answer(self, question: str, headers: list[str], rows: list[list[str]]) -> QueryResult:
-        question = (question or "").strip()
-        normalized_question = self._normalize(question).replace("_", " ")
-        question_lower = question.lower()
-        records = self._to_records(headers, rows)
-        row_limit = self._extract_limit(question) 
-
-        if not question:
-            return QueryResult(
-                question=question,
-                intent="help",
-                title="Ask a question about the cleaned CSV",
-                summary="Type a natural-language query and I will apply it to the cleaned data.",
-                sql_like="SELECT * FROM cleaned_data ;",
-                matched_row_count=len(records),
-                total_row_count=len(records),
-                table_headers=["Tip", "Use a question like"],
-                table_rows=[["Count rows", "How many rows are in the file?"], ["Filter rows", "Show rows where a column contains a value."]],
-            )
-
-        conditions = self._extract_conditions(question, headers)
-        filter_sql = self._build_where_sql(conditions)
-        filtered_records = self._apply_conditions(records, conditions)
-
-        intent = self._detect_intent(question_lower)
-        target_column = self._choose_target_column(question, headers, records)
-
-        if intent == "count":
-            matched = len(filtered_records)
-            table_headers = ["Metric", "Value"]
-            table_rows = [["Matching rows", str(matched)]]
-            summary = f"Found {matched} matching row{'s' if matched != 1 else ''}."
-            sql_like = f"SELECT COUNT(*) AS matching_rows FROM cleaned_data{filter_sql};"
-            return QueryResult(
-                question=question,
-                intent=intent,
-                title="Row count",
-                summary=summary,
-                sql_like=sql_like,
-                matched_row_count=matched,
-                total_row_count=len(records),
-                table_headers=table_headers,
-                table_rows=table_rows,
-                detail_lines=self._detail_lines_for_filters(conditions),
-            )
-
-        if intent in {"average", "sum", "min", "max", "median"}:
-            numeric_column = self._choose_numeric_column(question, headers, records, target_column)
-            if not numeric_column:
-                return self._fallback_answer(question, headers, records, filtered_records, row_limit)
-
-            numeric_values = self._extract_numeric_values([row.get(numeric_column, "") for row in filtered_records])
-            if not numeric_values:
-                return self._fallback_answer(question, headers, records, filtered_records, row_limit)
-
-            value, label = self._calculate_aggregate(intent, numeric_values)
-            summary = f"{label} for {numeric_column} is {value}."
-            sql_like = f"SELECT {label.upper()}(\"{numeric_column}\") AS result FROM cleaned_data{filter_sql};"
-            return QueryResult(
-                question=question,
-                intent=intent,
-                title=f"{label.title()} result",
-                summary=summary,
-                sql_like=sql_like,
-                matched_row_count=len(filtered_records),
-                total_row_count=len(records),
-                table_headers=["Metric", "Value"],
-                table_rows=[[f"{label.title()} {numeric_column}", value]],
-                detail_lines=self._detail_lines_for_filters(conditions),
-            )
-
-        if intent == "distinct":
-            distinct_column = self._choose_target_column(question, headers, records)
-            if not distinct_column:
-                return self._fallback_answer(question, headers, records, filtered_records, row_limit)
-
-            unique_values = self._distinct_values(filtered_records, distinct_column, row_limit)
-            summary = f"Found {len(unique_values)} unique value{'s' if len(unique_values) != 1 else ''} in {distinct_column}."
-            sql_like = f"SELECT DISTINCT \"{distinct_column}\" FROM cleaned_data{filter_sql} LIMIT {row_limit};"
-            return QueryResult(
-                question=question,
-                intent=intent,
-                title=f"Distinct values in {distinct_column}",
-                summary=summary,
-                sql_like=sql_like,
-                matched_row_count=len(filtered_records),
-                total_row_count=len(records),
-                table_headers=[distinct_column],
-                table_rows=[[value] for value in unique_values],
-                detail_lines=self._detail_lines_for_filters(conditions),
-            )
-
-        if intent == "rows" or conditions:
-            result_rows = self._preview_rows(filtered_records, headers, row_limit)
-            summary = f"Showing {len(result_rows)} row{'s' if len(result_rows) != 1 else ''} out of {len(filtered_records)} matched row{'s' if len(filtered_records) != 1 else ''}."
-            sql_like = f"SELECT * FROM cleaned_data{filter_sql} LIMIT {row_limit};"
-            return QueryResult(
-                question=question,
-                intent="rows",
-                title="Filtered rows",
-                summary=summary,
-                sql_like=sql_like,
-                matched_row_count=len(filtered_records),
-                total_row_count=len(records),
-                table_headers=headers,
-                table_rows=result_rows,
-                detail_lines=self._detail_lines_for_filters(conditions),
-            )
-
-        keyword_filtered = self._keyword_filter(records, question)
-        if keyword_filtered:
-            result_rows = self._preview_rows(keyword_filtered, headers, row_limit)
-            matched_count = len(keyword_filtered)
-            summary = f"I found {matched_count} row{'s' if matched_count != 1 else ''} that match the words in your question."
-            sql_like = f"SELECT * FROM cleaned_data WHERE <keyword match> LIMIT {row_limit};"
-            return QueryResult(
-                question=question,
-                intent="keyword",
-                title="Keyword match",
-                summary=summary,
-                sql_like=sql_like,
-                matched_row_count=matched_count,
-                total_row_count=len(records),
-                table_headers=headers,
-                table_rows=result_rows,
-                detail_lines=["No structured filter was detected, so I matched the important words across every column."],
-            )
-
-        return self._fallback_answer(question, headers, records, filtered_records, row_limit)
-
-    def _fallback_answer(
+ 
+    def answer(
         self,
         question: str,
         headers: list[str],
-        records: list[dict[str, str]],
-        filtered_records: list[dict[str, str]],
-        row_limit: int,
+        rows: list[list[str]],
+        preview_rows: list[list[str]] | None = None,
+        cleaning_prompt: str | None = None,
+        summary_notes: list[str] | None = None,
     ) -> QueryResult:
-        preview_rows = self._preview_rows(records, headers, row_limit)
+        question     = (question or "").strip()
+        total        = len(rows)
+        sample       = preview_rows or rows[:20]
+        norm_q       = self._norm(question)
+ 
+        if not question:
+            return self._help_result(total)
+ 
+        # ── 1. Try cheap local patterns first ─────────────────────────────────
+        local = self._local_answer(question, norm_q, headers, rows, sample, total)
+        if local:
+            return local
+ 
+        # ── 2. Call OpenRouter ONCE to get SQL ────────────────────────────────
+        sql = self._openrouter_sql(question, headers, sample, cleaning_prompt, summary_notes)
+ 
+        if not sql:
+            return self._preview_result(question, headers, sample, total,
+                                        "Could not generate SQL. Showing a data preview instead.")
+ 
+        try:
+            result_headers, result_rows = self._run_sql(sql, headers, rows)
+        except Exception as exc:
+            return self._preview_result(
+                question, headers, sample, total,
+                f"SQL execution failed: {exc}  |  SQL was: {sql}",
+            )
+ 
         return QueryResult(
-            question=question,
-            intent="help",
-            title="I need a clearer query",
-            summary="I can count rows, calculate numeric summaries, list distinct values, and filter rows using any column name in the file.",
-            sql_like="SELECT * FROM cleaned_data ;",
-            matched_row_count=len(filtered_records) if filtered_records else len(records),
-            total_row_count=len(records),
-            table_headers=headers,
-            table_rows=preview_rows,
-            detail_lines=[f"Available columns: {', '.join(headers)}" if headers else "No columns detected."],
+            question          = question,
+            intent            = "openrouter_sql",
+            title             = "Query result",
+            summary           = f"Found {len(result_rows)} row(s).",
+            sql_like          = sql,
+            matched_row_count = len(result_rows),
+            total_row_count   = total,
+            table_headers     = result_headers,
+            table_rows        = result_rows,
+            detail_lines      = [
+                f"SQL: {sql}",
+                f"Input rows: {total}  |  Output rows: {len(result_rows)}",
+            ],
         )
-
-    def _to_records(self, headers: list[str], rows: list[list[str]]) -> list[dict[str, str]]:
-        records: list[dict[str, str]] = []
-        for row in rows:
-            padded_row = list(row) + [""] * max(0, len(headers) - len(row))
-            records.append({header: padded_row[index] if index < len(padded_row) else "" for index, header in enumerate(headers)})
-        return records
-
-    def _extract_limit(self, question: str) -> int | None:
-        match = re.search(r"\b(?:top|first|limit)\s+(\d+)\b", question.lower())
-        if match:
-            value = int(match.group(1))
-            return value if value > 0 else None
-        return None
-
-    def _detect_intent(self, question_lower: str) -> str:
-        if any(keyword in question_lower for keyword in ["how many", "count rows", "number of rows", "row count", "how much"]):
-            return "count"
-        if any(keyword in question_lower for keyword in ["average", "mean"]):
-            return "average"
-        if any(keyword in question_lower for keyword in ["sum", "total of", "total"]):
-            return "sum"
-        if any(keyword in question_lower for keyword in ["minimum", "lowest", "smallest", "min "]):
-            return "min"
-        if any(keyword in question_lower for keyword in ["maximum", "highest", "largest", "max "]):
-            return "max"
-        if any(keyword in question_lower for keyword in ["median"]):
-            return "median"
-        if any(keyword in question_lower for keyword in ["distinct", "unique", "different values"]):
-            return "distinct"
-        if any(keyword in question_lower for keyword in ["show", "display", "list", "rows where", "find rows", "filter", "where"]):
-            return "rows"
-        return "help" if not question_lower.strip() else "rows"
-
-    def _choose_target_column(self, question: str, headers: list[str], records: list[dict[str, str]]) -> str | None:
-        if not headers:
+ 
+    # ── OpenRouter SQL generation ─────────────────────────────────────────────
+ 
+    def _openrouter_sql(
+        self,
+        question: str,
+        headers: list[str],
+        preview_rows: list[list[str]],
+        cleaning_prompt: str | None,
+        summary_notes: list[str] | None,
+    ) -> str | None:
+        """
+        Ask OpenRouter to turn the user's plain-English question into ONE SQLite
+        SELECT statement against the table `cleaned_data`.
+ 
+        We send:
+          - exact column names
+          - up to 20 sample rows (so the model can infer data shapes)
+          - the cleaning prompt (context on what was cleaned)
+        """
+        sample_dicts = [
+            dict(zip(headers, (row + [""] * len(headers))[:len(headers)]))
+            for row in preview_rows[:20]
+        ]
+ 
+        system_block = (
+            "You are a precise SQLite SQL generator for a data chatbot.\n\n"
+            "RULES:\n"
+            "- Output JSON ONLY with keys: sql, title, summary. No markdown.\n"
+            "- `sql` must be a single read-only SELECT (or WITH…SELECT) statement.\n"
+            "- The table name is always `cleaned_data`.\n"
+            "- Column names must be taken EXACTLY from the 'Available columns' list.\n"
+            "- Always quote column names with double quotes: \"column_name\".\n"
+            "- NEVER use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA, ATTACH.\n"
+            "- If the question asks for unique values, use SELECT DISTINCT.\n"
+            "- If the question asks for a count, use COUNT(*).\n"
+            "- If the question asks for averages / sums / min / max, use the matching aggregate.\n"
+            "- For numeric comparisons cast the column: CAST(\"col\" AS REAL).\n"
+            "- For vague questions like 'show data' or 'status', use: "
+            "  SELECT * FROM cleaned_data LIMIT 20\n\n"
+            "Examples:\n"
+            "  'how many rows' → {\"sql\":\"SELECT COUNT(*) AS row_count FROM cleaned_data\","
+            "\"title\":\"Row count\",\"summary\":\"Total rows.\"}\n"
+            "  'show unique gender' → {\"sql\":\"SELECT DISTINCT \\\"gender\\\" FROM cleaned_data\","
+            "\"title\":\"Unique gender values\",\"summary\":\"Distinct values.\"}\n"
+            "  'average age' → {\"sql\":\"SELECT AVG(CAST(\\\"age\\\" AS REAL)) AS avg_age FROM cleaned_data\","
+            "\"title\":\"Average age\",\"summary\":\"Mean value.\"}\n"
+            "  'rows where age > 30' → {\"sql\":\"SELECT * FROM cleaned_data "
+            "WHERE CAST(\\\"age\\\" AS REAL) > 30 LIMIT 50\","
+            "\"title\":\"Age > 30\",\"summary\":\"Filtered rows.\"}"
+        )
+ 
+        context_bits = [
+            f"Available columns: {json.dumps(headers)}",
+            f"Sample rows (first {len(sample_dicts)}): {json.dumps(sample_dicts)}",
+        ]
+        if cleaning_prompt:
+            context_bits.append(f"Cleaning prompt used: {cleaning_prompt}")
+        if summary_notes:
+            context_bits.append(f"Cleaning notes: {json.dumps(summary_notes[:3])}")
+ 
+        full_prompt = (
+            f"{system_block}\n\n"
+            + "\n".join(context_bits)
+            + f"\n\nUser question: {question}"
+        )
+ 
+        print(f"[_openrouter_sql] Sending question to OpenRouter: {question[:120]}")
+        raw    = _openrouter.call(full_prompt, max_tokens=300)
+        parsed = _parse_json(raw)
+        if not parsed:
             return None
+ 
+        sql = str(parsed.get("sql") or "").strip()
+        print(f"[_openrouter_sql] Generated SQL: {sql}")
+        return sql or None
+ 
+    # ── Local fast-path answers (no API call) ─────────────────────────────────
+ 
+    def _local_answer(
+        self,
+        question: str,
+        norm_q: str,
+        headers: list[str],
+        rows: list[list[str]],
+        sample: list[list[str]],
+        total: int,
+    ) -> QueryResult | None:
+ 
+        # preview / show data
+        if re.search(r"\b(preview|sample|show\s+data|show\s+rows|first\s+rows?|display)\b", norm_q):
+            return self._preview_result(question, headers, sample, total, "Sample rows from cleaned data.")
 
-        lower_question = question.lower()
-        direct_matches = [header for header in headers if self._header_matches_question(header, lower_question)]
-        if direct_matches:
-            return direct_matches[0]
-
-        scored_headers = sorted(headers, key=lambda header: self._header_score(header, lower_question), reverse=True)
-        best_header = scored_headers[0]
-        if self._header_score(best_header, lower_question) >= 0.35:
-            return best_header
-
-        if len(self._numeric_columns(headers, records)) == 1:
-            return self._numeric_columns(headers, records)[0]
-
+        # arithmetic transform preview (e.g. 'increase age by 1')
+        arith = self._parse_arithmetic_prompt(question, headers)
+        if arith:
+            transformed_sample = [self._apply_arithmetic_preview(row, headers, arith) for row in sample]
+            op_label = arith["operation"]
+            value_label = arith["value"]
+            return QueryResult(
+                question=question,
+                intent="local_transform_preview",
+                title="Transformed preview",
+                summary=f"Applied {arith['column']} {op_label} {value_label} to the preview rows.",
+                sql_like=FALLBACK_SQL,
+                matched_row_count=len(transformed_sample),
+                total_row_count=total,
+                table_headers=headers,
+                table_rows=transformed_sample,
+                detail_lines=[
+                    "Answered locally — no SQL needed.",
+                    f"Preview shows {arith['column']} updated in the output rows.",
+                ],
+            )
+ 
+        # row count
+        if re.search(r"\b(count|how many|number of rows?|row count|total rows?)\b", norm_q):
+            sql = "SELECT COUNT(*) AS row_count FROM cleaned_data"
+            h, r = self._run_sql(sql, headers, rows)
+            return QueryResult(
+                question=question, intent="count_rows",
+                title="Row count",
+                summary=f"{r[0][0] if r else 0} rows in dataset.",
+                sql_like=sql, matched_row_count=1, total_row_count=total,
+                table_headers=h, table_rows=r,
+                detail_lines=["Answered locally — no API call needed."],
+            )
+ 
+        # schema / columns
+        if re.search(r"\b(columns?|headers?|schema|fields?)\b", norm_q):
+            return QueryResult(
+                question=question, intent="schema",
+                title="Column names",
+                summary=f"{len(headers)} columns: {', '.join(headers)}",
+                sql_like=FALLBACK_SQL, matched_row_count=0, total_row_count=total,
+                table_headers=["column"], table_rows=[[h] for h in headers],
+                detail_lines=["Answered locally — no API call needed."],
+            )
+ 
         return None
+ 
+    # ── SQL runner ────────────────────────────────────────────────────────────
+ 
+    def _run_sql(self, sql: str, headers: list[str], rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+        sql = self._validate_sql(sql)
+        conn = sqlite3.connect(":memory:")
+        try:
+            safe_cols = [h.replace('"', '""') for h in headers]
+            col_defs  = ", ".join(f'"{c}" TEXT' for c in safe_cols)
+            conn.execute(f"CREATE TABLE cleaned_data ({col_defs})")
+            width = len(headers)
+            norm_rows = [
+                [("" if v is None else str(v)) for v in (list(r[:width]) + [""] * max(0, width - len(r)))]
+                for r in rows
+            ]
+            conn.executemany(
+                f"INSERT INTO cleaned_data VALUES ({','.join('?' * width)})",
+                norm_rows,
+            )
+            conn.commit()
+            cur  = conn.execute(sql)
+            desc = cur.description or []
+            return (
+                [str(c[0]) for c in desc],
+                [["" if v is None else str(v) for v in row] for row in cur.fetchall()],
+            )
+        finally:
+            conn.close()
+ 
+    def _validate_sql(self, sql: str) -> str:
+        s = (sql or "").strip().rstrip(";").strip()
+        if not s:
+            raise ValueError("SQL is empty.")
+        low = s.lower()
+        if not (low.startswith("select") or low.startswith("with")):
+            raise ValueError("Only SELECT queries are allowed.")
+        blocked = [" insert ", " update ", " delete ", " drop ", " alter ",
+                   " create ", " pragma ", " attach ", " detach ", " truncate "]
+        padded = f" {low} "
+        for b in blocked:
+            if b in padded:
+                raise ValueError(f"Blocked SQL keyword: {b.strip()}")
+        if ";" in s:
+            raise ValueError("Only single statements allowed.")
+        return s
+ 
+    # ── Result builders ───────────────────────────────────────────────────────
+ 
+    def _preview_result(self, q, headers, sample, total, summary) -> QueryResult:
+        return QueryResult(
+            question=q, intent="preview", title="Data preview",
+            summary=summary, sql_like=FALLBACK_SQL,
+            matched_row_count=len(sample), total_row_count=total,
+            table_headers=headers, table_rows=sample,
+            detail_lines=["Preview generated locally."],
+        )
+ 
+    def _help_result(self, total) -> QueryResult:
+        return QueryResult(
+            question="", intent="help", title="Ask a data question",
+            summary="Type a question about your cleaned CSV.",
+            sql_like=FALLBACK_SQL, matched_row_count=0, total_row_count=total,
+            table_headers=["Example question"],
+            table_rows=[
+                ["How many rows are in the dataset?"],
+                ["Show unique values in gender"],
+                ["Show rows where age > 30"],
+                ["What is the average age?"],
+                ["Show rows where full_name contains Smith"],
+            ],
+        )
+ 
+    # ── Util ──────────────────────────────────────────────────────────────────
+ 
+    @staticmethod
+    def _norm(text: str) -> str:
+        return re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
 
-    def _choose_numeric_column(self, question: str, headers: list[str], records: list[dict[str, str]], preferred: str | None = None) -> str | None:
-        numeric_columns = self._numeric_columns(headers, records)
-        if preferred and preferred in numeric_columns:
-            return preferred
+    def _parse_arithmetic_prompt(self, question: str, headers: list[str]) -> dict | None:
+        text = self._norm(question)
+        header_lookup = {self._norm(h): h for h in headers}
 
-        if preferred:
-            maybe = self._best_numeric_match(preferred, numeric_columns)
-            if maybe:
-                return maybe
+        patterns = [
+            (r"\b(?:increase|increment|add)\s+([a-z0-9_ ]+?)\s+by\s+([+-]?\d+(?:\.\d+)?)\b", "+"),
+            (r"\b(?:decrease|decrement|subtract)\s+([a-z0-9_ ]+?)\s+by\s+([+-]?\d+(?:\.\d+)?)\b", "-"),
+            (r"\b([a-z0-9_ ]+?)\s*([+\-*/])\s*([+-]?\d+(?:\.\d+)?)\b", None),
+        ]
 
-        direct_matches = [header for header in numeric_columns if self._header_matches_question(header, question.lower())]
-        if direct_matches:
-            return direct_matches[0]
-
-        if len(numeric_columns) == 1:
-            return numeric_columns[0]
-
-        if numeric_columns:
-            return numeric_columns[0]
-
-        return None
-
-    def _best_numeric_match(self, preferred: str, numeric_columns: list[str]) -> str | None:
-        preferred_norm = self._normalize(preferred)
-        for column in numeric_columns:
-            if self._normalize(column) == preferred_norm:
-                return column
-        return None
-
-    def _numeric_columns(self, headers: list[str], records: list[dict[str, str]]) -> list[str]:
-        numeric_columns: list[str] = []
-        for header in headers:
-            values = [row.get(header, "") for row in records if row.get(header, "") != ""]
-            if not values:
+        for pattern, fixed_op in patterns:
+            m = re.search(pattern, text)
+            if not m:
                 continue
-            numeric_values = self._extract_numeric_values(values)
-            if numeric_values and len(numeric_values) >= max(1, len(values) // 2):
-                numeric_columns.append(header)
-        return numeric_columns
 
-    def _extract_conditions(self, question: str, headers: list[str]) -> list[Condition]:
-        conditions: list[Condition] = []
-        question_lower = question.lower()
-
-        for header in headers:
-            header_pattern = self._header_pattern(header)
-            numeric_patterns = [
-                (rf"{header_pattern}\s*(?:is\s*)?(?:>=|greater than or equal to|at least|no less than)\s*(-?\d+(?:\.\d+)?)", ">=", None),
-                (rf"{header_pattern}\s*(?:is\s*)?(?:<=|less than or equal to|at most|no more than)\s*(-?\d+(?:\.\d+)?)", "<=", None),
-                (rf"{header_pattern}\s*(?:is\s*)?(?:>|greater than|more than|above|over)\s*(-?\d+(?:\.\d+)?)", ">", None),
-                (rf"{header_pattern}\s*(?:is\s*)?(?:<|less than|below|under)\s*(-?\d+(?:\.\d+)?)", "<", None),
-                (rf"{header_pattern}\s*(?:is\s*)?between\s*(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)", "between", None),
-                (rf"{header_pattern}\s*(?:is\s*)?(?:=|==|equals?|equal to)\s*(['\"]?)([^'\"\n,;]+?)\1(?=$|\s+(?:and|or|where|with|on|then|$))", "=", None),
-            ]
-            for pattern, operator, _ in numeric_patterns:
-                for match in re.finditer(pattern, question_lower):
-                    if operator == "between":
-                        conditions.append(Condition(column=header, operator=operator, value=match.group(1), value_end=match.group(2)))
-                    elif operator == "=":
-                        conditions.append(Condition(column=header, operator=operator, value=match.group(2).strip()))
-                    else:
-                        conditions.append(Condition(column=header, operator=operator, value=match.group(1)))
-
-            text_patterns = [
-                (rf"{header_pattern}\s*(?:contains|includes|has)\s+([a-z0-9_\-\s]+?)(?=$|\s+(?:and|or|where|with|on|then|limit|top|first)\b|[.,;])", "contains"),
-                (rf"{header_pattern}\s*(?:starts with|begins with)\s+([a-z0-9_\-\s]+?)(?=$|\s+(?:and|or|where|with|on|then|limit|top|first)\b|[.,;])", "startswith"),
-                (rf"{header_pattern}\s*(?:ends with)\s+([a-z0-9_\-\s]+?)(?=$|\s+(?:and|or|where|with|on|then|limit|top|first)\b|[.,;])", "endswith"),
-            ]
-            for pattern, operator in text_patterns:
-                for match in re.finditer(pattern, question_lower):
-                    conditions.append(Condition(column=header, operator=operator, value=match.group(1).strip()))
-
-        if not conditions:
-            numeric_literal = re.search(r"-?\d+(?:\.\d+)?", question_lower)
-            comparative_word = re.search(r"(?:greater than|more than|above|over|less than|below|under|at least|at most)", question_lower)
-            if numeric_literal and comparative_word:
-                best_column = None
-                best_score = 0.0
-                for header in headers:
-                    score = self._header_score(header, question_lower)
-                    if score > best_score:
-                        best_column = header
-                        best_score = score
-                if best_column and best_score >= 0.3:
-                    operator_map = {
-                        "greater than": ">",
-                        "more than": ">",
-                        "above": ">",
-                        "over": ">",
-                        "less than": "<",
-                        "below": "<",
-                        "under": "<",
-                        "at least": ">=",
-                        "at most": "<=",
-                    }
-                    operator = next((symbol for phrase, symbol in operator_map.items() if phrase in question_lower), "=")
-                    conditions.append(Condition(column=best_column, operator=operator, value=numeric_literal.group(0)))
-
-        return conditions
-
-    def _apply_conditions(self, records: list[dict[str, str]], conditions: list[Condition]) -> list[dict[str, str]]:
-        if not conditions:
-            return list(records)
-
-        matched_records: list[dict[str, str]] = []
-        for record in records:
-            if all(self._matches_condition(record, condition) for condition in conditions):
-                matched_records.append(record)
-        return matched_records
-
-    def _matches_condition(self, record: dict[str, str], condition: Condition) -> bool:
-        value = record.get(condition.column, "")
-        if condition.operator in {">", ">=", "<", "<=", "between"}:
-            try:
-                numeric_value = float(value)
-            except ValueError:
-                return False
-
-            target = float(condition.value)
-            if condition.operator == ">":
-                return numeric_value > target
-            if condition.operator == ">=":
-                return numeric_value >= target
-            if condition.operator == "<":
-                return numeric_value < target
-            if condition.operator == "<=":
-                return numeric_value <= target
-            if condition.operator == "between" and condition.value_end is not None:
-                upper = float(condition.value_end)
-                return target <= numeric_value <= upper
-
-        haystack = value.lower()
-        needle = condition.value.lower()
-        if condition.operator == "contains":
-            return needle in haystack
-        if condition.operator == "startswith":
-            return haystack.startswith(needle)
-        if condition.operator == "endswith":
-            return haystack.endswith(needle)
-        if condition.operator == "=":
-            return haystack == needle
-
-        return False
-
-    def _keyword_filter(self, records: list[dict[str, str]], question: str) -> list[dict[str, str]]:
-        tokens = [token for token in self._normalize(question).split() if token and token not in self.STOPWORDS]
-        if not tokens:
-            return []
-
-        matched_records: list[dict[str, str]] = []
-        for record in records:
-            haystack = " ".join(record.values()).lower()
-            if all(token in haystack for token in tokens):
-                matched_records.append(record)
-        return matched_records
-
-    def _distinct_values(self, records: list[dict[str, str]], column: str, limit: int) -> list[str]:
-        seen: list[str] = []
-        for record in records:
-            value = record.get(column, "").strip()
-            if value and value not in seen:
-                seen.append(value)
-            if len(seen) >= limit:
-                break
-        return seen
-
-    def _preview_rows(self, records: list[dict[str, str]], headers: list[str], limit: int) -> list[list[str]]:
-        rows: list[list[str]] = []
-        for record in records[:limit]:
-            rows.append([record.get(header, "") for header in headers])
-        return rows
-
-    def _calculate_aggregate(self, intent: str, values: list[float]) -> tuple[str, str]:
-        if intent == "average":
-            return self._format_number(mean(values)), "average"
-        if intent == "sum":
-            return self._format_number(sum(values)), "sum"
-        if intent == "min":
-            return self._format_number(min(values)), "minimum"
-        if intent == "max":
-            return self._format_number(max(values)), "maximum"
-        if intent == "median":
-            return self._format_number(median(values)), "median"
-        return self._format_number(sum(values)), "sum"
-
-    def _detail_lines_for_filters(self, conditions: list[Condition]) -> list[str]:
-        if not conditions:
-            return []
-
-        details: list[str] = []
-        for condition in conditions:
-            if condition.operator == "between" and condition.value_end is not None:
-                details.append(f"{condition.column} between {condition.value} and {condition.value_end}")
-            elif condition.operator in {">", ">=", "<", "<=", "="}:
-                details.append(f"{condition.column} {condition.operator} {condition.value}")
+            if fixed_op is None:
+                col_term, op, value_text = m.group(1), m.group(2), m.group(3)
             else:
-                details.append(f"{condition.column} {condition.operator} {condition.value}")
-        return details
+                col_term, value_text, op = m.group(1), m.group(2), fixed_op
 
-    def _build_where_sql(self, conditions: list[Condition]) -> str:
-        if not conditions:
-            return ""
+            col_term = col_term.strip()
+            if not col_term or col_term in {"all", "the", "a", "of", "in", "for", "to", "by"}:
+                continue
 
-        clauses: list[str] = []
-        for condition in conditions:
-            column_sql = f'"{condition.column}"'
-            if condition.operator == "between" and condition.value_end is not None:
-                clauses.append(f"{column_sql} BETWEEN {condition.value} AND {condition.value_end}")
-            elif condition.operator in {">", ">=", "<", "<="}:
-                clauses.append(f"{column_sql} {condition.operator} {condition.value}")
-            elif condition.operator == "=":
-                safe_value = condition.value.replace("'", "''")
-                clauses.append(f"{column_sql} = '{safe_value}'")
-            elif condition.operator == "contains":
-                clauses.append(f"LOWER({column_sql}) LIKE '%{condition.value.lower()}%'")
-            elif condition.operator == "startswith":
-                clauses.append(f"LOWER({column_sql}) LIKE '{condition.value.lower()}%'")
-            elif condition.operator == "endswith":
-                clauses.append(f"LOWER({column_sql}) LIKE '%{condition.value.lower()}'")
+            matched_column = None
+            norm_term = self._norm(col_term)
+            if norm_term in header_lookup:
+                matched_column = header_lookup[norm_term]
+            else:
+                for norm_header, original in header_lookup.items():
+                    if norm_term == norm_header or norm_term in norm_header or norm_header in norm_term:
+                        matched_column = original
+                        break
 
-        if not clauses:
-            return ""
-        return " WHERE " + " AND ".join(clauses)
+            if not matched_column:
+                continue
 
-    def _header_matches_question(self, header: str, question: str) -> bool:
-        header_pattern = self._header_pattern(header)
-        return bool(re.search(header_pattern, question))
-
-    def _header_score(self, header: str, question: str) -> float:
-        header_tokens = self._normalize(header).split("_")
-        question_tokens = set(self._normalize(question).split("_") + self._normalize(question).split())
-        if not header_tokens:
-            return 0.0
-
-        overlap = sum(1 for token in header_tokens if token and token in question_tokens)
-        if overlap == len(header_tokens):
-            return 1.0
-        return overlap / len(header_tokens)
-
-    def _header_pattern(self, header: str) -> str:
-        normalized = self._normalize(header).replace("_", " ").strip()
-        if not normalized:
-            return r""
-        return r"\b" + r"[\s_\-]+".join(re.escape(part) for part in normalized.split()) + r"\b"
-
-    def _normalize(self, text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-
-    def _extract_numeric_values(self, values: list[str]) -> list[float]:
-        numeric_values: list[float] = []
-        for value in values:
             try:
-                numeric_values.append(float(value))
+                value = float(value_text)
             except ValueError:
-                return []
-        return numeric_values
+                continue
 
-    def _format_number(self, value: float) -> str:
-        if value.is_integer():
-            return str(int(value))
-        return ("{:.6f}".format(value)).rstrip("0").rstrip(".")
+            return {
+                "column": matched_column,
+                "operation": op,
+                "value": value,
+            }
 
-    def _to_table_rows(self, result: QueryResult) -> list[list[str]]:
-        return result.table_rows
+        return None
+
+    def _apply_arithmetic_preview(self, row: list[str], headers: list[str], spec: dict) -> list[str]:
+        row = list(row)
+        column = spec["column"]
+        operation = spec["operation"]
+        value = float(spec["value"])
+
+        try:
+            idx = headers.index(column)
+        except ValueError:
+            return row
+
+        current = row[idx]
+        try:
+            current_value = float(current)
+        except (TypeError, ValueError):
+            return row
+
+        if operation == "+":
+            result = current_value + value
+        elif operation == "-":
+            result = current_value - value
+        elif operation == "*":
+            result = current_value * value
+        elif operation == "/":
+            result = current_value / value if value else current_value
+        else:
+            return row
+
+        if result.is_integer():
+            row[idx] = str(int(result))
+        else:
+            row[idx] = f"{result:.6f}".rstrip("0").rstrip(".")
+        return row
